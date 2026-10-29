@@ -15,7 +15,7 @@ const base = '/llms-from-scratch'
 const cacheCommand = process.argv.find(arg => ['dev', 'check', 'build'].includes(arg)) ?? 'build'
 
 export default defineConfig({
-  site: 'https://cyberspacelee.github.io',
+  site: 'https://xingcanlee.github.io',
   base,
   trailingSlash: 'always',
   integrations: [mdx()],

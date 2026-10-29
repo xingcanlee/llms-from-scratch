@@ -74,4 +74,4 @@ export function readingMinutes(body: string): number {
   return Math.max(1, Math.round(cjk / 400 + words / 200))
 }
 
-export const repoUrl = 'https://github.com/cyberspacelee/llms-from-scratch'
+export const repoUrl = 'https://github.com/xingcanlee/llms-from-scratch'

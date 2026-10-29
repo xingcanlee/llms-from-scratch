@@ -2,7 +2,7 @@
 
 一本层层递进的中文技术书：从链式法则与反向传播出发，亲手实现 Transformer，沿 2017—2026 年的架构演进走到 DeepSeek-V4，再讲清预训练、分布式训练、后训练与对齐，最后深入 GPU/CUDA 编程与 vLLM 式推理系统。路线参考 Stanford CS336《Language Modeling from Scratch》。
 
-**在线阅读：<https://cyberspacelee.github.io/llms-from-scratch/>**
+**在线阅读：<https://xingcanlee.github.io/llms-from-scratch/>**
 
 | 部分 | 内容 |
 | --- | --- |
