@@ -1,0 +1,214 @@
+---
+title: DeepSeek 开源模型谱系：2023—2026
+description: 收集 deepseek-ai 发布的全部主要开源模型与基础设施，梳理主干架构的五次结构变化，并按官方配置逐层算出每一代每 token 的全局 KV Cache。
+order: 1
+code:
+  - src/llms_from_scratch/deepseek/lineage.py
+  - tests/deepseek/test_lineage.py
+---
+
+研究一个模型家族，第一步是把它“有什么”弄清楚。DeepSeek 从 2023 年 10 月发布第一个代码模型到 2026 年 10 月的 V4.1-Flash-1017，在 Hugging Face 上一共发布了一百多个权重仓库，在 GitHub 上开源了四十多个项目。其中大部分是同一代模型的变体（Base/Chat、不同尺寸、不同日期的小版本、蒸馏模型），真正改变主干结构的只有五六次。本章先把这些发布按家族与时间整理成表，再沿主干的结构变化走一遍，最后用一个统一的指标——每 token 需要长期保存的 KV 字节数——把各代放在同一把尺子上比较。这个指标会贯穿后面每一章：几乎每一次结构变化，都可以理解为在这把尺子上又砍掉了一截。
+
+## 发布全景
+
+下表收录每个家族的代表性发布，日期是 Hugging Face 仓库的创建日期，参数一栏对 MoE 写作“总参数 / 每 token 激活参数”。同一行里的尺寸系列、Base 与 Chat 版本、以及 R1 的 6 个蒸馏模型（基于 Qwen2.5 与 Llama 3 的 1.5B–70B）没有逐一列出；完整列表在 `lineage.py` 的 `RELEASES` 中，测试检查它按时间排序且没有重复。
+
+| 时间 | 仓库 | 总参数 / 激活 | 要点 |
+| --- | --- | --- | --- |
+| 2023-10 | deepseek-coder | 1.3B / 6.7B / 33B | 稠密代码模型，16K 上下文 |
+| 2023-11 | deepseek-llm（V1） | 7B / 67B | 稠密；67B 用 GQA（8 个 KV 头） |
+| 2024-01 | deepseek-moe-16b | 16.4B / 2.8B | 细粒度专家 + 共享专家 |
+| 2024-02 | deepseek-math-7b | 7B | 首次提出 GRPO |
+| 2024-03 | deepseek-vl | 1.3B / 7B | 视觉语言模型 |
+| 2024-04 | DeepSeek-V2（及 Lite） | 236B / 21B | MLA + DeepSeekMoE |
+| 2024-06 | DeepSeek-Coder-V2 | 236B / 21B | 由 V2 继续训练 |
+| 2024-07 | ESFT | 15.7B / 2.4B | 只微调与任务相关的专家 |
+| 2024-08 | DeepSeek-Prover-V1.5 | 7B | Lean 4 定理证明 |
+| 2024-09 | DeepSeek-V2.5 | 236B / 21B | Chat 与 Coder 合并 |
+| 2024-10 | Janus / JanusFlow | 1.3B | 理解与生成解耦的统一多模态 |
+| 2024-12 | deepseek-vl2 | 27.5B / 4.5B | MoE 视觉语言模型 |
+| 2024-12 | DeepSeek-V3 | 671B / 37B | 无辅助损失均衡、MTP、FP8 训练 |
+| 2025-01 | DeepSeek-R1（及 R1-Zero、蒸馏） | 671B / 37B | 大规模 RL 推理模型 |
+| 2025-01 | Janus-Pro | 1B / 7B | |
+| 2025-03 | DeepSeek-V3-0324 | 671B / 37B | |
+| 2025-04 | DeepSeek-Prover-V2 | 7B / 671B | |
+| 2025-05 | DeepSeek-R1-0528 | 671B / 37B | 另有 R1-0528-Qwen3-8B 蒸馏 |
+| 2025-08 | DeepSeek-V3.1 / Terminus | 671B / 37B | 思考与非思考混合 |
+| 2025-09 | DeepSeek-V3.2-Exp | 685B / 37B | DeepSeek 稀疏注意力（DSA） |
+| 2025-10 | DeepSeek-OCR | 3.3B | 光学上下文压缩 |
+| 2025-11 | DeepSeek-Math-V2 | 685B | 自验证的数学证明 |
+| 2025-12 | DeepSeek-V3.2 / V3.2-Speciale | 685B / 37B | DSA 正式版 |
+| 2026-01 | DeepSeek-OCR-2 | 3.4B | |
+| 2026-04 | DeepSeek-V4-Flash / V4-Pro | 284B / 13B；1.6T / 49B | CSA/HCA、mHC、Muon、1M 上下文 |
+| 2026-06 | V4-Flash/Pro-DSpark | 同上 | 附加 DSpark 投机解码模块；另发布若干 EAGLE-3/DFlash/DSpark 草稿模型 |
+| 2026-07/08 | V4-Flash-0731 / V4-Pro-0813 | 同上 | V4 正式版 |
+| 2026-08 | V4-Flash-Vision-Exp | 284B / 13B | 实验性多模态 |
+| 2026-09 | DeepSeek-V4.1-Flash | 552B / 8B（prefill）·16B（decode） | CED、CSA2、FP4 KV、Engram（另有 196B 参数）、原生多模态 |
+| 2026-10 | DeepSeek-V4.1-Flash-1017 | 同上 | 小版本更新 |
+
+几点说明。V3.2 与 Math-V2 的 685B 包含了 MTP 模块的约 14B 参数，主干与 V3 相同是 671B。V4.1-Flash 仓库的权重文件合计约 763B 个参数，其中 552B 属于主干，196B 属于两张 Engram 表，其余是视觉编码器与 DSpark 草稿模块；它的“激活参数”第一次区分了 prefill 与 decode，原因在[V4.1：CSA2 与因果编码器—解码器](/deepseek/csa2-ced/)中解释。
+
+## 主干的五次结构变化
+
+把上表中真正改变主干结构的发布挑出来，可以得到一条很清楚的主线。
+
+<Diagram width={720} height={250} label="DeepSeek 主干架构的五次结构变化时间线">
+  <Arrow from={[20, 120]} to={[705, 120]} tone="muted" />
+  <Box x={20} y={40} w={110} h={58} label="V1 2023" sub="稠密 · GQA" />
+  <Box x={145} y={40} w={110} h={58} label="V2 2024" sub="MLA · MoE" tone="accent" />
+  <Box x={270} y={40} w={120} h={58} label="V3 2024" sub="无辅助损失 · FP8" tone="accent" />
+  <Box x={405} y={40} w={90} h={58} label="V3.2" sub="DSA" tone="accent" />
+  <Box x={510} y={40} w={90} h={58} label="V4" sub="CSA/HCA" tone="accent" />
+  <Box x={615} y={40} w={90} h={58} label="V4.1" sub="CSA2 · CED" tone="strong" />
+  <Text x={75} y={150} label="缓存 K/V" size="sm" />
+  <Text x={200} y={150} label="缓存潜向量" size="sm" />
+  <Text x={330} y={150} label="同上" size="sm" tone="muted" />
+  <Text x={450} y={150} label="只读 top-k" size="sm" />
+  <Text x={555} y={150} label="沿序列压缩" size="sm" />
+  <Text x={660} y={150} label="跨层共享" size="sm" />
+  <Text x={75} y={180} label="380 KiB" size="sm" mono />
+  <Text x={200} y={180} label="67.5 KiB" size="sm" mono />
+  <Text x={330} y={180} label="68.6 KiB" size="sm" mono />
+  <Text x={450} y={180} label="46.9 KiB" size="sm" mono />
+  <Text x={555} y={180} label="3.4 KiB" size="sm" mono />
+  <Text x={660} y={180} label="890 B" size="sm" mono bold />
+  <Text x={360} y={226} label="下两行：注意力缓存的形态，以及每 token 全部层的全局 KV（按官方格式计算）" size="sm" tone="muted" />
+  <Fragment slot="caption">从左到右是主干结构真正发生变化的六代。第二行写出注意力缓存的形态变化：从每层每头的完整 K/V，到所有头共享的潜向量，到只读一部分，到沿序列维压缩，再到跨层共享。最下面一行是下一节代码算出的每 token 全局 KV 字节数（DeepSeek-V1 取 67B）。</Fragment>
+</Diagram>
+
+**V1（2023）**是一个典型的 LLaMA 式稠密模型：Pre-Norm、RMSNorm、RoPE、SwiGLU，67B 用 GQA。**DeepSeekMoE（2024 年初）**提出细粒度专家与共享专家，但注意力未变。**V2（2024 年 4 月）**同时引入两项沿用至今的设计：多头潜在注意力 MLA（只缓存一个 512 维潜向量与一个 64 维位置键）与 DeepSeekMoE 的大规模版本（160 个路由专家选 6 个，外加 2 个共享专家，并按设备分组限制路由）。**V3（2024 年 12 月）**的主干几乎就是放大的 V2，变化在训练侧：sigmoid 打分加无辅助损失的偏置均衡、多 token 预测（MTP）、FP8 混合精度训练、DualPipe 流水线。V3 系列此后的 R1、V3.1 都没有改主干。
+
+**V3.2（2025 年）**是第一次为长上下文改注意力：在 MLA 上加一个闪电索引器，每个查询只读 2048 个 token（DSA）。**V4（2026 年 4 月）**改动最大：放弃 MLA 的上投影，改为所有头共享一个 512 维的 KV 条目（共享 KV 的 MQA）；沿序列维把每 4 个或每 128 个 token 压成一个条目（CSA 与 HCA 交替）；加入 128 个 token 的滑动窗口；用 mHC 替换残差连接；前 3 层用 token 哈希路由，其余层用 $\sqrt{\operatorname{softplus}}$ 打分；训练改用 Muon；路由专家权重用 FP4 存储。**V4.1（2026 年 9 月）**保留 V4 的局部处理骨架，把“全局分支”进一步简化与共享：CSA2 让主 KV、索引器键与 top-$k$ 索引跨层复用，CED 让解码器的全局 KV 来自编码器输出，主 KV 以 FP4 缓存；同时加入 Engram 条件记忆、DSpark 投机解码与原生多模态。
+
+下表对比后四代的主干超参数，全部取自官方 `config.json`。
+
+| | V3 / V3.2 | V4-Flash | V4-Pro | V4.1-Flash |
+| --- | --- | --- | --- | --- |
+| 隐藏维 / 层数 | 7168 / 61 | 4096 / 43 | 7168 / 61 | 5120 / 40 |
+| 查询头 × 头维 | 128 × (128+64) | 64 × 512 | 128 × 512 | 64 × 512 |
+| KV 形态 | 潜向量 512 + 64 | 共享 KV，512 | 共享 KV，512 | 共享 KV，512 |
+| 序列压缩 | 无 | 4 与 128 交替 | 4 与 128 交替 | 编码器 2，解码器 1 |
+| 稀疏选择 top-$k$ | —/2048 | 512 | 1024 | 512 |
+| 路由专家（选几个） | 256（8） | 256（6） | 384（6） | 384（6） |
+| 打分函数 | sigmoid | √softplus | √softplus | √softplus |
+| 残差 | 普通 | mHC，$n=4$ | mHC，$n=4$ | Single-Pass mHC，$n=4$ |
+| 预训练 token | 14.8T | 32T+ | 32T+ | 45T |
+| 上下文 | 128K | 1M | 1M | 1M |
+
+## 全局 KV 账本
+
+“每 token 的 KV Cache”在不同代际里含义不同，需要先约定口径。V4 起每层都有一个 128 个 token 的滑动窗口，它的大小与序列长度无关，长序列下可以忽略；真正随长度增长的是**全局 KV**：MLA 的潜向量、DSA 的索引器键、V4 的压缩条目。下面的代码只累加全局 KV，并按各代部署时的实际存储格式计算字节数。
+
+<CodeFile path="src/llms_from_scratch/deepseek/lineage.py" region="ledger" />
+
+逐代核对一下算式。V1 67B 有 95 层、8 个 KV 头、头维 128，每层每 token 存 $2\times8\times128$ 个 BF16，合计 $95\times4096=389120$ 字节，即 380 KiB。V3 每层存 $512+64=576$ 个 BF16，61 层合计 70272 字节（68.6 KiB），V2 只有 60 层，为 67.5 KiB。V3.2 部署时把潜向量存成 FP8（每 128 维一个 FP32 缩放），位置键仍为 BF16，再加 128 维 FP8 索引器键，每层 $512+16+128+132=788$ 字节，61 层约 46.9 KiB。这里看到 DSA 本身并不省缓存——它省的是读取量，缓存减小来自 FP8。
+
+V4-Flash 的 43 层中前 2 层只有滑窗，其后 21 层 CSA（$m=4$）与 20 层 HCA（$m=128$）交替。每个压缩条目 512 维：非 RoPE 的 448 维 FP8（每 64 维一个缩放，7 字节），RoPE 的 64 维 BF16，共 583 字节；CSA 层另有 128 维 FP4 索引器键（64 字节数值加 4 字节缩放）。于是每 token 为
+
+$$
+21\times\frac{583+68}{4}+20\times\frac{583}{128}\approx 3417.8+91.1=3508.8\ \text{bytes}.
+$$
+
+V4.1-Flash 的计算最干净，这也是它设计的结果。只有 4 个 Full 模式层产生全局 KV：编码器 3 个（$m=2$）、解码器 1 个（$m=1$）。每个条目是 512 维 FP4 主 KV（256 字节数值 + 每 16 维一个 E4M3 缩放共 32 字节）加 128 维 MXFP4 索引器键（68 字节），共 356 字节，于是
+
+<KeyEq label="V4.1-Flash 的每 token 全局 KV">
+
+$$
+3\times\frac{356}{2}+1\times\frac{356}{1}=534+356=890\ \text{bytes}.
+$$
+
+</KeyEq>
+
+这正是模型卡上的 890 字节。测试 `test_v41_flash_global_kv_is_890_bytes` 与 `test_generation_ratios_match_official_claims` 复核了这个数，以及模型卡中“约为 V4-Flash 的 1/4、DeepSeek-V1 的 1/437”这两个比值（$389120/890\approx437.2$，$3508.8/890\approx3.94$）。
+
+<Bars label="每 token 全局 KV（KiB，单序列全部层）" unit="KiB" items={[
+  { label: 'DeepSeek-V1 67B（GQA）', value: 380, tone: 'muted' },
+  { label: 'DeepSeek-V2（MLA）', value: 67.5, tone: 'info' },
+  { label: 'DeepSeek-V3（MLA）', value: 68.6, tone: 'info' },
+  { label: 'DeepSeek-V3.2（MLA + 索引器，FP8）', value: 46.9, tone: 'info' },
+  { label: 'DeepSeek-V4-Flash（CSA/HCA）', value: 3.43, tone: 'accent' },
+  { label: 'DeepSeek-V4.1-Flash（CSA2，FP4）', value: 0.87, tone: 'strong' },
+]}>
+  <Fragment slot="caption">线性刻度。V2 的 MLA 把缓存缩小到 V1 的约 1/6；V4 的序列维压缩又缩小了一个数量级以上；V4.1 的跨层共享与 FP4 再缩小约 4 倍。1M token 的上下文在 V3 上需要约 70 GB 全局 KV，在 V4.1-Flash 上不到 1 GB。</Fragment>
+</Bars>
+
+这把尺子量的是存储，不是计算。V3.2 的缓存与 V3 同一量级，却把每个查询要读的条目从全部历史降到 2048 个；V4.1 的单 token decode FLOPs 在上下文从 4K 增长到 1M 时只增加约 1/4（技术报告图 2），这得益于解码器里分层索引器把每层的打分范围限制在常数大小的候选池内。存储、读取量与计算是三个不同的维度，后面几章会分别讨论。
+
+## 基础设施
+
+DeepSeek 在模型之外开源的基础设施，几乎都对应某一代的某个结构需求。按用途归类：
+
+| 用途 | 项目 | 对应的结构或问题 |
+| --- | --- | --- |
+| 注意力 kernel | FlashMLA | MLA 的吸收计算、V3.2 稀疏 MLA、V4.1 的“RoPE—注意力—逆 RoPE—转换”融合 kernel |
+| 矩阵乘与融合 | DeepGEMM、TileKernels、DeepJIT | FP8/FP4 GEMM、Mega-MoE、Mega-mHC、Mega-Gate |
+| top-$k$ | DeepSelect | DSA/CSA2 索引器的 top-$k$ 与采样器 |
+| MoE 通信与均衡 | DeepEP、EPLB、LPLB | 专家并行的 all-to-all、专家放置、线性规划负载均衡 |
+| 流水线 | DualPipe、profile-data | V3 训练的双向流水线与计算—通信重叠 |
+| 存储与数据 | 3FS、smallpond | 训练数据与持久化 KV Cache 的分布式文件系统 |
+| 投机解码 | DeepSpec | DSpark 的训练与评测 |
+| 推理与部署 | DeepInfer、deepseek-recipe | 推理框架；V4/V4.1 的提示格式编码与输出解析 |
+| 智能体 | deepseek-harness | V4.1 评测所用的 agent 框架 |
+| 华为昇腾 | DeepGEMM-Ascend、DeepEP-Ascend | 同名库的昇腾移植 |
+| 记忆 | Engram | 条件记忆论文的参考实现 |
+
+本部分只在需要时引用这些项目，重点仍是模型本身的数据流。
+
+## 小结
+
+- deepseek-ai 在 2023-10 到 2026-10 间发布了一百多个权重仓库，真正改变主干的是 V2（MLA+MoE）、V3（训练侧）、V3.2（DSA）、V4（序列压缩、共享 KV、mHC）与 V4.1（CSA2、CED、FP4 KV）。
+- “每 token 全局 KV”是比较各代的统一尺子：V1 67B 为 380 KiB，V3 为 68.6 KiB，V4-Flash 约 3.4 KiB，V4.1-Flash 为 890 字节。
+- 890 字节来自 4 个 Full 层：编码器 3 个 $m=2$、解码器 1 个 $m=1$，每个条目 = 288 字节 FP4 主 KV + 68 字节 MXFP4 索引器键。
+- 存储、读取量与计算是三个不同的维度：DSA 主要减少读取，序列压缩与跨层共享减少存储，分层索引器减少长上下文下的计算增长。
+- 开源基础设施与结构演进一一对应：FlashMLA、DeepGEMM、DeepEP、DeepSelect、DeepSpec 等分别服务于某一代的某个瓶颈。
+
+## 练习
+
+1. 若 V4.1-Flash 的主 KV 改回 V4 的格式（448 维 FP8 + 7 字节缩放 + 64 维 BF16），其余不变，每 token 全局 KV 是多少？FP4 带来了多少倍的节省？
+
+<details>
+<summary>答案</summary>
+
+条目变为 $583+68=651$ 字节，总量 $3\times651/2+651=1627.5$ 字节。与 890 字节相比约 1.83 倍，这就是报告中“FP4 主 KV 几乎把存储减半”的含义；索引器键本来就是 FP4，不受影响。
+
+</details>
+
+2. V3.2 的缓存为什么反而比 V3 小？DSA 是否减少了缓存？
+
+<details>
+<summary>答案</summary>
+
+DSA 不减少缓存：每个历史 token 的潜向量都要保留，因为不同查询会选中不同的 token；它还额外增加了每层 132 字节的索引器键。V3.2 的缓存更小，是因为部署时把 512 维潜向量从 BF16 改成了 FP8（官方推理代码在写缓存前做 FP8 量化—反量化来模拟这一点）。DSA 减少的是每个查询的读取量与注意力计算量。
+
+</details>
+
+3. 用 V4-Pro 的配置（61 层：前两层 HCA，其后 CSA、HCA 交替，最后一层 CSA；条目格式同 V4-Flash）估算每 token 全局 KV，并与 V4-Flash 比较。
+
+<details>
+<summary>答案</summary>
+
+官方 `compress_ratios` 的前 61 项是 128、128，然后 4、128 交替 29 对，最后一个 4，于是 CSA 层 30 个、HCA 层 31 个。CSA 每层 $(583+68)/4=162.75$ 字节，HCA 每层 $583/128\approx4.55$ 字节，合计约 $4882.5+141.2\approx5024$ 字节，约为 V4-Flash 的 1.4 倍。参数量差 5.6 倍而缓存只差 1.4 倍，因为两者的条目维度都是 512、压缩率相同，缓存只随“压缩层数”增长，与隐藏维无关。
+
+</details>
+
+4. 为什么说“1M 上下文在 V3 上需要约 70 GB 全局 KV”？这个数对单卡部署意味着什么？
+
+<details>
+<summary>答案</summary>
+
+$10^6\times70272$ 字节 $\approx70.3$ GB，这只是一条序列。一张 80 GB 的卡放下这条序列的缓存后几乎没有空间留给权重与其他请求，所以 V3 的 128K 上下文已经接近实际服务的上限。V4.1-Flash 同样长度只需 $0.89$ GB，单卡可以同时容纳几十条百万 token 的会话（权重另行分布在多卡上）。
+
+</details>
+
+## 参考文献
+
+- DeepSeek-AI. [DeepSeek LLM: Scaling Open-Source Language Models with Longtermism](https://arxiv.org/abs/2401.02954). 2024.
+- Dai et al. [DeepSeekMoE: Towards Ultimate Expert Specialization in Mixture-of-Experts Language Models](https://arxiv.org/abs/2401.06066). 2024.
+- DeepSeek-AI. [DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model](https://arxiv.org/abs/2405.04434). 2024.
+- DeepSeek-AI. [DeepSeek-V3 Technical Report](https://arxiv.org/abs/2412.19437). 2024.
+- DeepSeek-AI. [DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning](https://arxiv.org/abs/2501.12948). 2025.
+- DeepSeek-AI. [DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models](https://arxiv.org/abs/2512.02556). 2025.
+- DeepSeek-AI. [DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence](https://arxiv.org/abs/2606.19348). 2026.
+- DeepSeek-AI. [DeepSeek-V4.1-Flash: Pushing the Limits of KV Cache Compression](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/DeepSeek_V41_Tech_Report.pdf). 2026（技术报告 PDF，图 1(b) 与 §4.2.1 的模型配置）.
+- Hugging Face 组织页 [deepseek-ai](https://huggingface.co/deepseek-ai) 与 GitHub 组织页 [deepseek-ai](https://github.com/deepseek-ai)（发布日期与仓库列表，截至 2026-10-30）.
+- 官方配置：[DeepSeek-V3 config.json](https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json)、[DeepSeek-V4-Flash config.json](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/config.json)、[DeepSeek-V4-Pro config.json](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/config.json)、[DeepSeek-V4.1-Flash config.json](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/config.json).

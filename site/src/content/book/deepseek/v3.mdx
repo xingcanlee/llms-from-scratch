@@ -1,0 +1,178 @@
+---
+title: 读 V3 官方代码：MLA、分组路由与 FP8 块量化
+description: 把 MLA 的矩阵吸收对应到 DeepSeek-V3 官方推理代码的 wkv_a/wkv_b 权重布局，读懂 naive 与 absorb 两条路径、分组受限路由与 128×128 块级 FP8 量化。
+order: 2
+code:
+  - src/llms_from_scratch/deepseek/v3.py
+  - tests/deepseek/test_v3.py
+---
+
+[注意力变体：MQA、GQA 与 MLA](/architecture/attention-variants/) 从缓存公式出发推导了 MLA：用低秩潜向量 $c^{KV}$ 代替每头的 K/V，用矩阵吸收让注意力直接在潜空间里计算，用解耦 RoPE 解决位置编码与吸收的冲突。那一章的实现按论文记号写成了五个独立的矩阵。DeepSeek-V3 的官方推理代码 `inference/model.py` 写法不同：同样的数学被压进了两个合并的投影 `wkv_a` 与 `wkv_b`，吸收用两个 `einsum` 完成，缓存的形状由一个全局开关 `attn_impl` 决定。读懂这段代码，是读懂后面 V3.2、V4、V4.1 的前提，因为它们都是在这份代码上一层层改出来的。
+
+本章按官方文件的顺序读三个类：`MLA`、`Gate`、`MoE`，最后看 V3 的 FP8 块量化。移植在 `src/llms_from_scratch/deepseek/v3.py`，保留官方的变量名与张量布局，只去掉张量并行与 FP8 GEMM kernel。
+
+## MLA 的官方权重布局
+
+论文中 MLA 的键值侧有四个矩阵：下投影 $W^{DKV}$、位置键投影 $W^{KR}$、键上投影 $W^{UK}$、值上投影 $W^{UV}$。官方代码把它们两两合并：
+
+| 官方名 | 形状（V3） | 对应论文 | 说明 |
+| --- | --- | --- | --- |
+| `wq_a` | $7168\to1536$ | $W^{DQ}$ | 查询下投影，之后接 `q_norm` |
+| `wq_b` | $1536\to128\times192$ | $[W^{UQ};W^{QR}]$ | 每头 128 维内容 + 64 维位置 |
+| `wkv_a` | $7168\to512+64$ | $[W^{DKV};W^{KR}]$ | 一次投影同时得到潜向量与位置键 |
+| `kv_norm` | 512 | — | 只归一潜向量，不归一位置键 |
+| `wkv_b` | $512\to128\times(128+128)$ | $[W^{UK};W^{UV}]$ | 每头先 128 维键、后 128 维值 |
+| `wo` | $128\times128\to7168$ | $W^O$ | |
+
+合并的好处是少一次 GEMM 启动，代价是读代码时要知道怎样把它们切开。关键的一行是
+
+```python
+wkv_b = self.wkv_b.weight.view(self.n_local_heads, -1, self.kv_lora_rank)  # [H, 128+128, 512]
+```
+
+`nn.Linear` 的权重形状是 `[out, in]`，输出维按“头 0 的 256 维、头 1 的 256 维……”排列，所以 `view(H, 256, 512)` 之后，`wkv_b[h, :128]` 就是第 $h$ 个头的 $W^{UK}_h\in\mathbb R^{128\times512}$，`wkv_b[h, -128:]` 是 $W^{UV}_h$。
+
+<Diagram width={720} height={270} label="DeepSeek-V3 MLA 的官方权重布局与两种缓存">
+  <Box x={20} y={110} w={90} h={50} label="x" sub="(B, T, 7168)" />
+  <Box x={160} y={30} w={130} h={50} label="wq_a → q_norm" sub="1536" mono />
+  <Box x={330} y={30} w={140} h={50} label="wq_b" sub="128 × (128+64)" mono />
+  <Box x={160} y={170} w={130} h={50} label="wkv_a" sub="512 + 64" mono tone="accent" />
+  <Region x={320} y={110} w={160} h={150} title="absorb 缓存：576 个数" tone="info" />
+  <Box x={330} y={145} w={140} h={44} label="kv_norm → c_kv" sub="512" tone="info" />
+  <Box x={330} y={205} w={140} h={44} label="RoPE → k_pe" sub="64" tone="info" />
+  <Box x={540} y={145} w={160} h={44} label="wkv_b" sub="128 × (128 键 + 128 值)" mono />
+  <Box x={540} y={215} w={160} h={36} label="naive 缓存：每头 K、V" size="sm" tone="ghost" />
+  <Arrow from={[110, 135]} to={[160, 55]} />
+  <Arrow from={[110, 135]} to={[160, 195]} />
+  <Arrow from={[290, 55]} to={[330, 55]} />
+  <Arrow from={[290, 188]} to={[330, 167]} />
+  <Arrow from={[290, 202]} to={[330, 227]} />
+  <Arrow from={[470, 167]} to={[540, 167]} dashed label="naive" />
+  <Arrow from={[620, 189]} to={[620, 215]} dashed />
+  <Fragment slot="caption">`wkv_a` 的输出前 512 维经 `kv_norm` 成为潜向量 $c^{KV}$，后 64 维经 RoPE 成为所有头共享的位置键 $k^R$。naive 路径用 `wkv_b` 把潜向量还原成每头 128 维键与 128 维值并缓存它们；absorb 路径只缓存两个蓝色张量，`wkv_b` 被拆开分别并入查询与输出。</Fragment>
+</Diagram>
+
+## naive 与 absorb：同一个注意力的两种算法
+
+官方代码用模块级变量 `attn_impl` 在两种实现间切换，缓存的形状也随之不同：`naive` 预分配 `k_cache[B, S, H, 192]` 与 `v_cache[B, S, H, 128]`，`absorb` 预分配 `kv_cache[B, S, 512]` 与 `pe_cache[B, S, 64]`。下面是移植后的完整前向：
+
+<CodeFile path="src/llms_from_scratch/deepseek/v3.py" region="mla" />
+
+absorb 路径的三个 `einsum` 对应三步改写。第一步把键上投影并入查询：
+
+$$
+q_{t,h}^{C\top}k^C_{s,h}=q_{t,h}^{C\top}\big(W^{UK}_hc_s\big)=\big(W^{UK\top}_hq^C_{t,h}\big)^\top c_s ,
+$$
+
+代码中 `einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :128])` 算出 512 维的“潜空间查询”。第二步，分数 = 潜空间查询点积 `kv_cache` + 位置查询点积 `pe_cache`；第三步，先在潜空间里按注意力权重求和，最后才乘 $W^{UV}_h$：
+
+$$
+\sum_s a_{t,s}\,W^{UV}_hc_s=W^{UV}_h\Big(\sum_s a_{t,s}c_s\Big).
+$$
+
+测试 `test_naive_and_absorb_agree_for_prefill_and_decode` 用同一组权重比较两条路径：一次 prefill 结果相同；absorb 路径先 prefill 6 个 token、再逐个 decode 4 个 token，也与 naive 的一次前向相同，而缓存每 token 只有 $16+8=24$ 个数。
+
+把吸收后的计算换个角度看，会得到一个对后续章节很重要的观察：所有 128 个头读的是**同一个** 576 维“键” $[c_s;k^R_s]$ 与同一个 512 维“值” $c_s$，差别只在查询。这正是一个头维 576 的 **MQA**。decode 时每个头的查询都要和同一份缓存做点积，算术强度比 MHA 高 128 倍，这就是 FlashMLA 能把 decode 做到接近算力上限的原因。反过来，prefill 时查询很多、每个 token 都要与所有键交互，吸收后每次点积要做 576 维而不是 192 维，计算量反而更大，所以官方后来的 V3.2 代码在 prefill 时走 naive（称为 MHA 模式），decode 时走 absorb（MQA 模式），见下一章。
+
+`absorbed_flops_ratio` 给出一个直观的数：若只缓存潜向量，又在每一步临时把整段历史还原成 K/V，那么每个 decode 查询每头要做 $S\cdot512\cdot256$ 次乘加；吸收路径只需 $S\cdot(512+64+512)$ 次加上与长度无关的两次小矩阵乘，长上下文下约为前者的 1/120。
+
+### YaRN 与 softmax 缩放
+
+V3 的上下文从 4K 经 YaRN 扩展到 128K（`rope_factor=40`，见[长上下文：位置外推与滑动窗口](/architecture/long-context/)）。官方代码在 `max_seq_len > original_seq_len` 时还会修改 softmax 的缩放：
+
+$$
+\text{scale}=\frac{1}{\sqrt{d_{qk}}}\cdot m^2,\qquad m=0.1\,\mu\ln s+1,
+$$
+
+其中 $s$ 是扩展倍数，$\mu$ 是 config 中的 `mscale`。这是 YaRN 的“温度修正”：插值后注意力分布变平，乘一个略大于 1 的系数让它重新变尖。$m$ 要平方，是因为 YaRN 原本把它分别乘在 $q$ 与 $k$ 上。`softmax_scale_with_yarn` 实现了这个公式。
+
+## Gate：分组受限路由
+
+DeepSeek-V3 的每个 MoE 层有 256 个路由专家，每个 token 选 8 个。训练时专家分布在多台机器上，若一个 token 的 8 个专家散落在 8 台机器上，all-to-all 通信的跨节点流量就会很大。V3 用**分组受限路由**（node-limited routing）把它限制住：256 个专家按机器分成 8 组，每个 token 先选 4 组，再在这 4 组中选 8 个专家。V2 有同样的机制（160 个专家分 8 组，限 3 组），称为设备受限路由。
+
+<CodeFile path="src/llms_from_scratch/deepseek/v3.py" region="gate" />
+
+逐行读：
+
+1. `scores.sigmoid()`：V3 用 sigmoid 而不是 softmax 打分，每个专家的分数互相独立。
+2. `original_scores = scores`：保存不带偏置的分数，后面用来算权重。
+3. `scores + self.bias`：无辅助损失均衡的偏置，只影响“选谁”（推导见[混合专家 MoE](/architecture/moe/)）。
+4. 组分 = 组内**最高两个**分数之和。用两个而不是一个，是因为每个 token 平均从每个入选组里选 2 个专家（8/4），组分应当反映“这组能贡献的前两名”。
+5. 掩掉未入选的组，在剩下的 128 个专家中选 top-8。
+6. 权重取原始分数并归一化，再乘 `route_scale = 2.5`。sigmoid 分数归一化后 8 个权重之和为 1，乘 2.5 补偿专家输出的尺度。
+
+手算一个缩小的例子。8 个专家分 4 组（每组 2 个），每个 token 选 2 组、2 个专家，偏置为 0。设 sigmoid 分数为 $(0.9,0.1\mid0.6,0.55\mid0.2,0.3\mid0.8,0.05)$。组分是组内两个分数之和：$1.0,1.15,0.5,0.85$，选第 1、2 组（编号从 0 起为组 0 与组 1）。在专家 0–3 中选 top-2：专家 0（0.9）与专家 2（0.6），而分数 0.8 的专家 6 因为所在的组 3 落选而被排除。权重 $= (0.9,0.6)/1.5\times2.5=(1.5,1.0)$。
+
+测试 `test_gate_respects_group_limit_and_bias_only_selects` 检查两件事：每个 token 选中的专家最多来自 `n_limited_groups` 个组；给专家 0 加一个很大的偏置后它总被选中，但返回的权重仍等于用原始 sigmoid 分数归一化的值。
+
+## MoE：按专家循环的参考实现
+
+<CodeFile path="src/llms_from_scratch/deepseek/v3.py" region="moe" />
+
+官方 `MoE.forward` 的写法与这里几乎相同：先用 `bincount` 统计每个专家分到多少个 token，跳过空专家，再对每个专家 `torch.where(indices == i)` 取出它负责的 token 及其在 top-$k$ 中的槽位，用对应的权重加权累加。张量并行时每个 rank 只持有 `n_routed_experts / world_size` 个专家，循环只走本地专家，最后 `all_reduce` 把各 rank 的部分和加起来；共享专家每个 rank 都有完整的一份，在 all-reduce 之后加上。
+
+这种“按专家循环”的写法简单可读，但它让 GPU 一次只算一个小矩阵乘。生产实现把同一专家的 token 收集成连续的块，用分组 GEMM 一次算完所有专家，再把结果按原顺序散回，专家分布在多卡时还要经过 DeepEP 的 all-to-all，见[专家并行与 all-to-all](/distributed/expert-parallel/)。V3 的前 3 层不是 MoE 而是稠密 FFN（`n_dense_layers = 3`），浅层的表示还不够分化，路由的收益小、负载却最难均衡。
+
+## FP8 块量化
+
+V3 是第一个用 FP8 训练的大规模开源模型，官方发布的权重也是 FP8。它的量化粒度是**块级**的：权重每 $128\times128$ 个元素共用一个 FP32 缩放，激活每个 token 的每 128 个通道共用一个缩放。
+
+<CodeFile path="src/llms_from_scratch/deepseek/v3.py" region="fp8_block" />
+
+为什么不用每个张量一个缩放？FP8 E4M3 的动态范围约为 $2^{-9}$ 到 448，尾数只有 3 位。若一个 $7168\times18432$ 的矩阵只有一个缩放，它由整个矩阵的最大值决定，一个离群值就会把其余所有元素挤到动态范围的低端，许多小权重直接下溢为 0。块级缩放把离群值的影响限制在一个 $128\times128$ 的块里。测试 `test_block_fp8_quant_error_is_relative_to_block_max` 构造了一个量级大 100 倍的子块：只有这个子块自己的缩放变大，其他子块的相对误差仍不超过 $2^{-4}$（3 位尾数的舍入误差界）。
+
+官方推理代码的 `weight_dequant` 正是这里 `block_dequant` 的 Triton 版本：absorb 路径需要把 FP8 的 `wkv_b` 反量化成 BF16 才能做 `einsum`。V3.1 起官方把缩放的格式从 FP32 改成 UE8M0（只有指数的 8 位数，即 2 的幂），乘缩放变成了指数加法；V4 起路由专家权重进一步降到 FP4。精度格式本身的推导在[混合精度训练：从 FP16 到 FP8](/pretraining/mixed-precision/)。
+
+## 小结
+
+- 官方代码把 MLA 的四个键值矩阵合并为 `wkv_a`（$W^{DKV}$ 与 $W^{KR}$）与 `wkv_b`（每头 $W^{UK}$ 与 $W^{UV}$），`view(H, 256, 512)` 后按行切开。
+- `attn_impl="naive"` 缓存还原后的 K/V，`"absorb"` 只缓存 512 维潜向量与 64 维位置键；吸收后所有头共享同一份键值，是头维 576 的 MQA。
+- 吸收让 decode 的算术强度大幅提高，但 prefill 时点积维度从 192 增加到 576，所以后续版本 prefill 走 naive、decode 走 absorb。
+- V3 路由：sigmoid 打分，加偏置后按“组内前二之和”选 4 组，再在组内选 8 个专家；权重用不带偏置的分数归一化后乘 2.5。
+- FP8 块量化每 $128\times128$ 个权重一个缩放，把离群值的影响限制在块内。
+
+## 练习
+
+1. 在手算例子中，若给专家 6 加偏置 $0.4$，路由结果会怎样变化？最终权重是多少？
+
+<details>
+<summary>答案</summary>
+
+加偏置后专家 6 的选择分数为 1.2，组 3 的组分变为 $1.2+0.05=1.25$，成为最高；组 1 为 1.15，入选的两组变为组 3 与组 1。候选专家为 2、3、6、7，选择分数分别为 0.6、0.55、1.2、0.05，top-2 是专家 6 与专家 2。权重用原始分数：$(0.8,0.6)/1.4\times2.5\approx(1.43,1.07)$。专家 0 虽然原始分数最高（0.9），但它所在的组 0 落选（组分 1.0），被排除。
+
+</details>
+
+2. 为什么 `kv_norm` 只作用在潜向量上，而不作用在位置键 `k_pe` 上？
+
+<details>
+<summary>答案</summary>
+
+`kv_norm` 是 RMSNorm，它稳定潜向量的尺度，使 `wkv_b` 上投影后的键值范数可控。位置键要经过 RoPE，RoPE 是旋转，本身保持范数；对它做归一化会把不同 token 的位置键都拉到相同的范数，丢掉 $W^{KR}x$ 的幅度信息，而这个幅度会影响位置项在注意力分数中所占的比重。V4 改为共享 KV 后，整条 512 维向量（含最后 64 维 RoPE 部分）一起归一化，因为那里没有单独的位置键了。
+
+</details>
+
+3. 计算 V3 的一次 decode，在上下文 $S=32768$ 时，absorb 路径每头需要读取的缓存字节数（BF16），与 naive 缓存比较。
+
+<details>
+<summary>答案</summary>
+
+absorb：所有头共读一份 $S\times576\times2\approx37.7$ MB（每层），与头数无关。naive：每头读自己的 $S\times(192+128)\times2\approx21.0$ MB，128 个头合计约 2.68 GB（每层）。吸收后每层 decode 的读取量是 naive 缓存的 1/71。这个比值与 $\frac{128\times320}{576}\approx71.1$ 一致，也就是本章开头缓存大小之比。
+
+</details>
+
+4. 分组受限路由会不会降低模型质量？从“组分取前二之和”的设计说明它试图减轻的问题。
+
+<details>
+<summary>答案</summary>
+
+会有一点限制：某个 token 最想要的 8 个专家若分布在 5 个以上的组中，必有一部分被排除。V2 报告的实验表明，限制组数 $M\ge3$ 时效果与不受限的 top-$k$ 路由大致相当，V3 取 $M=4$。组分取前二之和而不是组内最大值，使组的排名更接近“这组能贡献多少个高分专家”：一个组只有一个高分专家时，取最大值会高估它的价值，导致选中后组内第二个专家分数很低，浪费名额。
+
+</details>
+
+## 参考文献
+
+- DeepSeek-AI. [DeepSeek-V2](https://arxiv.org/abs/2405.04434). 2024（§2.1 MLA，§2.2 设备受限路由）.
+- DeepSeek-AI. [DeepSeek-V3 Technical Report](https://arxiv.org/abs/2412.19437). 2024（§2.1 MLA 与 DeepSeekMoE，§3.3 FP8 训练，§4.3 YaRN 扩展）.
+- 官方推理代码：[deepseek-ai/DeepSeek-V3 inference/model.py](https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py) 与 [kernel.py](https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/kernel.py).
+- [deepseek-ai/FlashMLA](https://github.com/deepseek-ai/FlashMLA)：吸收后 MQA 形式的 decode kernel.
+- Peng et al. [YaRN: Efficient Context Window Extension of Large Language Models](https://arxiv.org/abs/2309.00071). 2023.

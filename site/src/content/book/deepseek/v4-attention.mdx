@@ -1,0 +1,155 @@
+---
+title: V4：压缩器、共享 KV 与汇聚注意力
+description: 读 DeepSeek-V4-Flash 官方代码中的 Attention 与 Compressor：重叠的门控池化如何在 prefill 与逐 token decode 中给出相同的压缩条目，键值共享的 MQA、注意力汇聚、逆 RoPE 与分组低秩输出投影。
+order: 4
+code:
+  - src/llms_from_scratch/deepseek/v4_attention.py
+  - tests/deepseek/test_v4_attention.py
+---
+
+V3.2 把每个查询要读的历史从全部降到 2048 个 token，但每个 token 的缓存一个不少。要支撑 100 万 token 的上下文，DeepSeek-V4 在序列维上也做了压缩：每 4 个 token（CSA 层）或每 128 个 token（HCA 层）合成一个 KV 条目，再加上最近 128 个 token 的原始 KV 组成的滑动窗口。[稀疏注意力：从 NSA、DSA 到压缩注意力](/architecture/sparse-attention/)用一个不重叠的平均池化讲了这个思路。本章读官方 `DeepSeek-V4-Flash/inference/model.py`，关注那一章刻意略去的工程细节：压缩器在 decode 时如何“攒够一组再输出”、重叠窗口怎样实现、为什么输出要做一次逆 RoPE、注意力汇聚在 kernel 里是怎么算的。这些细节决定了实现是否正确，而且全部被 V4.1 继承。
+
+V4 的注意力还有一个更根本的变化：**放弃了 MLA 的上投影**。上一章看到，MLA 吸收之后，所有头共读一个 576 维的键与一个 512 维的值，本质上已经是 MQA。V4 干脆直接训练这种形式：每个 token 只产生一个 512 维向量，它**同时**是所有 64 个查询头的键和值，最后 64 维承载 RoPE。没有 $W^{UK}$、$W^{UV}$，也就不需要吸收。
+
+## 一层注意力读什么
+
+<Diagram width={720} height={250} label="DeepSeek-V4 一层注意力读取的两类 KV 及其在 kv 张量中的拼接">
+  <Region x={20} y={20} w={330} h={110} title="滑动窗口：最近 128 个原始 token" tone="accent2" />
+  <Matrix x={40} y={60} rows={1} cols={8} cell={[32, 30]} gap={4} tone="accent2" />
+  <Region x={370} y={20} w={330} h={110} title="压缩 KV：每 m 个 token 一个条目" tone="info" />
+  <Matrix x={390} y={60} rows={1} cols={6} cell={[42, 30]} gap={6} tone="info" highlight={[{ cols: [1, 4], tone: 'accent' }]} />
+  <Box x={20} y={170} w={330} h={50} label="topk_idxs 前半：滑窗位置，-1 为空位" size="sm" />
+  <Box x={370} y={170} w={330} h={50} label="后半：索引器选中（CSA）或全部可见（HCA）" size="sm" />
+  <Arrow from={[185, 130]} to={[185, 170]} />
+  <Arrow from={[535, 130]} to={[535, 170]} />
+  <Fragment slot="caption">官方代码把两类 KV 沿序列维拼成一个 `kv` 张量（滑窗在前、压缩条目在后），把两组位置拼成一个 `topk_idxs`，交给同一个 `sparse_attn` kernel。压缩条目的位置都加上了偏移量（滑窗部分的长度），-1 表示空位。CSA 层（$m=4$）由索引器选 512 个条目（图中深色），HCA 层（$m=128$）读全部可见条目。</Fragment>
+</Diagram>
+
+V4-Flash 的 43 层中，第 0、1 层只有滑窗（`compress_ratio = 0`），其后 CSA 与 HCA 交替；V4-Pro 的前两层是 HCA。这种“局部窗口 + 压缩全局”的结构是 V4 系列的骨架，V4.1 的报告把它概括为“以 SWA 为主干的局部处理，加上压缩的全局上下文”。
+
+## 压缩器：攒够一组再输出
+
+<CodeFile path="src/llms_from_scratch/deepseek/v4_attention.py" region="compressor" />
+
+先看不重叠的情形（$m=128$）。每个 token 投影出一个候选向量 $c_j$（`wkv`）与一组逐维的门控 logits $z_j$（`wgate`），再加上组内位置 $j\bmod m$ 的可学习偏置 `ape`（absolute positional embedding）。一组 $m$ 个 token 在组内按维做 softmax，得到条目：
+
+$$
+\hat c=\sum_{j\in\text{group}}\operatorname{softmax}_j\big(z_j+B_{j\bmod m}\big)\odot c_j ,
+$$
+
+再经 RMSNorm，并按组内第一个 token 的位置加 RoPE。带压缩的层（连同它的滑窗部分）使用更大的 `compress_rope_theta = 160000` 并启用 YaRN，因为一个条目代表 $m$ 个 token，需要覆盖的位置跨度更大；纯滑窗层只看 128 个 token，用基础的 $\theta=10000$ 且不做 YaRN。
+
+prefill 时（`start_pos == 0`）一次处理整段：前 `cutoff` 个 token 恰好组成整数个组，直接 `unflatten` 后求和；不满一组的尾巴写进 `kv_state` 与 `score_state`。decode 时每步来一个 token，写进状态的第 `start_pos % m` 个槽；只有当 `(start_pos + 1) % m == 0`，也就是刚好凑满一组时，才对整个状态做 softmax 加权求和并输出一个条目，否则返回 `None`。由于 softmax 与求和对组内 token 的到达顺序没有要求，这两种路径给出的条目完全相同。
+
+**重叠**（CSA 层，$m=4$）更巧妙一些。`wkv` 与 `wgate` 输出的维度翻倍为 $2\times512$：前 512 维给“下一组”用，后 512 维给“本组”用。条目 $j$ 由 8 个候选组成：上一组 4 个 token 的前半通道，加上本组 4 个 token 的后半通道。`overlap_transform` 把 `[B, G, 4, 1024]` 重排成 `[B, G, 8, 512]`，第 0 组没有上一组，前 4 行填 0 并把分数填 $-\infty$。decode 时状态有 $2m$ 行：前 $m$ 行保存上一组，后 $m$ 行填本组；凑满一组输出后，把后 $m$ 行整体搬到前 $m$ 行，作为下一组的“上一组”。
+
+<Diagram width={720} height={220} label="重叠压缩：条目 j 汇聚上一组的前半通道与本组的后半通道">
+  <Matrix x={40} y={40} rows={1} cols={12} cell={[44, 30]} gap={6} values={[['t0', 't1', 't2', 't3', 't4', 't5', 't6', 't7', 't8', 't9', 't10', 't11']]} tone="muted" highlight={[{ cols: [0, 1, 2, 3], tone: 'info' }, { cols: [4, 5, 6, 7], tone: 'accent' }]} />
+  <Box x={60} y={130} w={160} h={44} label="条目 0" sub="本组 t0–t3" tone="info" />
+  <Box x={260} y={130} w={200} h={44} label="条目 1" sub="t0–t3 前半 + t4–t7 后半" tone="accent" />
+  <Box x={500} y={130} w={180} h={44} label="条目 2" sub="t4–t7 前半 + t8–t11 后半" />
+  <Arrow from={[140, 70]} to={[140, 130]} tone="info" />
+  <Arrow from={[180, 70]} to={[300, 130]} tone="info" dashed />
+  <Arrow from={[340, 70]} to={[380, 130]} tone="accent" />
+  <Arrow from={[380, 70]} to={[540, 130]} tone="accent" dashed />
+  <Fragment slot="caption">实线是“本组”贡献（后半通道），虚线是“下一组”贡献（前半通道）。每个 token 参与两个相邻条目，相邻条目的感受野重叠 4 个 token，减轻了硬切分带来的边界信息割裂；但条目 $j$ 仍然只依赖到本组最后一个 token，没有破坏因果性。</Fragment>
+</Diagram>
+
+测试 `test_compressor_streaming_equals_prefill` 对 $m=4$（重叠）与 $m=8$（不重叠），分别用 1 个、$m$ 个、$2m+3$ 个 token 做 prefill，其余逐 token decode，拼起来的条目与一次 prefill 完全一致。`test_overlap_entry_sees_previous_group` 改动第 0 组最后一个 token，确认条目 0 与条目 1 都变了、条目 2 不变。
+
+写这段移植时遇到过一个 bug，值得记下来：重叠模式下，若一条新序列的 prefill 短于一组，状态的前 $m$ 行（“上一组”）不会被覆盖，残留的是上一条序列的数据。官方实现每次只服务一条按顺序处理的请求，短 prefill 少见；移植在 `start_pos == 0` 时先清空状态，测试中的“1 个 token prefill”正是为了覆盖这种情况。
+
+## 共享 KV、汇聚与逆 RoPE
+
+<CodeFile path="src/llms_from_scratch/deepseek/v4_attention.py" region="attention" />
+
+按顺序读注意力的前向：
+
+**查询。** `wq_a → q_norm → wq_b` 与 V3 相同，之后每个头再做一次**无参数**的 RMS 归一化（`q *= rsqrt(mean(q²) + eps)`）。键在 `kv_norm` 后同样是单位 RMS，于是点积的尺度只由两个向量的夹角决定，与 QK-Norm 的作用相同（见[训练稳定性](/pretraining/stability/)）。
+
+**键值。** `kv = kv_norm(wkv(x))` 是一个 512 维向量，最后 64 维加 RoPE。官方代码随后对前 448 维做 FP8 量化—反量化，模拟部署时的缓存精度（量化感知训练，QAT），RoPE 的 64 维保持 BF16。
+
+**注意力。** 官方的 `sparse_attn` 是一个 TileLang kernel，它的语义如下：
+
+<CodeFile path="src/llms_from_scratch/deepseek/v4_attention.py" region="sparse_attn" />
+
+对每个查询，按 `topk_idxs` 从 `kv` 中收集条目，-1 的位置分数为 $-\infty$；softmax 的分母里多加一项 $\exp(\text{sink}_h)$：
+
+<KeyEq label="带汇聚的注意力">
+
+$$
+o_{t,h}=\frac{\sum_{s\in\mathcal I_t}e^{\ell_{t,h,s}}\,v_s}{e^{\text{sink}_h}+\sum_{s\in\mathcal I_t}e^{\ell_{t,h,s}}} .
+$$
+
+</KeyEq>
+
+汇聚相当于一个值为 0 的虚拟键，让一个头在“没什么可看”时把权重放到它上面，而不是被迫平均分配给无关的条目（动机见[长上下文：位置外推与滑动窗口](/architecture/long-context/)）。kernel 里有一个细节：在线 softmax 的运行最大值初始化为 $-10^{30}$ 而不是 $-\infty$，于是一个查询若没有任何有效条目，输出是全 0 而不是 NaN。测试 `test_sparse_attn_sink_and_padding` 检查了这三种情况：只有一个有效键时输出就是它；没有有效键时输出为 0；汇聚 logit 很大时输出趋于 0。
+
+**逆 RoPE。** 键值共享带来一个问题：值也带着 RoPE。$o_t=\sum_s a_{t,s}v_s$ 的最后 64 维是 $\sum_s a_{t,s}R_s\tilde v_s$，其中 $R_s$ 是位置 $s$ 的旋转，这个输出依赖**绝对**位置。V4 的做法是在输出上乘一次 $R_t^{-1}$：
+
+$$
+R_t^{-1}\sum_s a_{t,s}R_s\tilde v_s=\sum_s a_{t,s}R_{s-t}\tilde v_s ,
+$$
+
+旋转矩阵满足 $R_t^{-1}R_s=R_{s-t}$，于是输出只依赖相对位置 $s-t$，与分数 $q_t^\top R_t^{-1}R_sk_s$ 的相对性一致。代码里这一步是 `apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)`，即乘以旋转因子的共轭。测试 `test_output_depends_only_on_relative_positions` 把所有位置整体平移 37，输出不变——无论是纯滑窗层还是带压缩条目的层。
+
+**输出投影。** 64 个头 × 512 维 = 32768 维，直接投影回 4096 维需要一个 1.3 亿参数的矩阵。V4 把它分组做低秩：64 个头分成 8 组，每组 $8\times512=4096$ 维先投影到 1024 维（`wo_a`，块对角，所以用 `einsum` 而不是 `Linear`），8 组拼成 8192 维，再由 `wo_b` 投影回隐藏维。
+
+## 路由的两处变化
+
+V4 的 MoE 有两处新东西，都在 `Gate` 里。第一，打分函数从 sigmoid 换成 $\sqrt{\operatorname{softplus}(z)}$：它非负、对负的 logits 平滑趋于 0，对正的 logits 以 $\sqrt z$ 的速度增长，既不像 sigmoid 那样饱和，又不像指数那样爆炸。第二，**前 3 层用哈希路由**：每个 token id 对应的 6 个专家在 `tid2eid` 表中固定，与隐藏状态无关；权重仍由 $\sqrt{\operatorname{softplus}}$ 分数决定。浅层的表示主要由 token 本身决定，学习出来的路由与按 token id 查表区别不大，而后者天然均衡、无需偏置。
+
+另外，专家的 SwiGLU 对两个分支做了截断：上分支截断到 $[-10,10]$，门分支只截断上界 10。这是为了让 FP8/FP4 激活不越界，与 gpt-oss 的做法相同；V4 起路由专家的权重以 FP4 存储。
+
+## 小结
+
+- V4 放弃 MLA 的上投影：每个 token 一个 512 维向量同时充当所有查询头的键和值（共享 KV 的 MQA），最后 64 维带 RoPE。
+- 每层读两类 KV：128 个原始 token 的滑窗与压缩条目；CSA 层 $m=4$ 且由索引器选 512（Flash）或 1024（Pro）个条目，HCA 层 $m=128$ 读全部。
+- 压缩器是带组内位置偏置的逐维 softmax 门控池化；decode 时用状态攒够一组才输出，结果与 prefill 完全一致；$m=4$ 时相邻条目的窗口重叠一组。
+- 注意力分母加每头一个汇聚 logit；无有效条目时输出为 0。值带 RoPE，输出乘 $R_t^{-1}$ 后只依赖相对位置。
+- 输出投影分 8 组低秩；路由改用 $\sqrt{\operatorname{softplus}}$ 打分，前 3 层按 token id 哈希路由。
+
+## 练习
+
+1. 为什么压缩条目按“组内第一个 token”的位置加 RoPE，而不是最后一个？若改用最后一个，会不会破坏因果性？
+
+<details>
+<summary>答案</summary>
+
+只是一个约定：条目在组结束之后才对查询可见，RoPE 用哪个位置都不涉及未来信息。用组首位置的好处是条目 $j$ 的位置正好是 $j\cdot m$，prefill 时可以直接用 `freqs_cis[:cutoff:ratio]` 取出，decode 时是 `freqs_cis[start_pos + 1 - ratio]`。关键是 prefill 与 decode 用同一个约定，否则两条路径给出的条目不同。
+
+</details>
+
+2. 证明：若不做逆 RoPE，把所有位置整体平移 $\Delta$，输出的最后 64 维会被旋转 $R_\Delta$。
+
+<details>
+<summary>答案</summary>
+
+分数只依赖相对位置，平移后权重 $a_{t,s}$ 不变；值的 RoPE 部分从 $R_s\tilde v_s$ 变成 $R_{s+\Delta}\tilde v_s=R_\Delta R_s\tilde v_s$，所以 $o'_t=\sum_sa_{t,s}R_\Delta R_s\tilde v_s=R_\Delta o_t$。输出投影 `wo_a` 是一个固定矩阵，看到的输入随绝对位置旋转，等于要求它对所有旋转都学会同一件事，这在长度外推时尤其危险。
+
+</details>
+
+3. HCA 层在 1M 上下文、位置约 100 万处的查询要读多少个条目？CSA 层（V4-Flash）呢？
+
+<details>
+<summary>答案</summary>
+
+HCA：$10^6/128\approx7812$ 个压缩条目加 128 个滑窗条目，约 7940 个。CSA：512 个被选中的压缩条目（覆盖约 2048 个原始 token）加 128 个滑窗条目，共 640 个。这正是 V4 交替使用两种层的理由：CSA 读得少但依赖索引器的选择是否准确；HCA 读得较多但提供完整、无需选择的全局视野。
+
+</details>
+
+4. 汇聚 logit 为什么是每个头一个可学习参数，而不是与查询有关的量？
+
+<details>
+<summary>答案</summary>
+
+查询自己就能决定“想不想看”：若所有真实键的分数都很低，固定的汇聚 logit 自然在 softmax 中占主导。把汇聚做成常数，相当于给每个头设定一个基准分数，真实键要超过它才能分到权重。若让它依赖查询，就变成了额外的一个键，与 Qwen 门控注意力的输出门作用相近，但增加了参数与计算；V4 选择了最简单的形式。
+
+</details>
+
+## 参考文献
+
+- DeepSeek-AI. [DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence](https://arxiv.org/abs/2606.19348). 2026（§2.3 CSA 与 HCA，§2.4 mHC，§2.5 Muon）.
+- 官方推理代码：[DeepSeek-V4-Flash inference/model.py](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/inference/model.py)（`Compressor`、`Attention`、`Gate`）与 [kernel.py](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/inference/kernel.py)（`sparse_attn`）.
+- OpenAI. [gpt-oss-120b & gpt-oss-20b Model Card](https://arxiv.org/abs/2508.10925). 2025（注意力汇聚与 SwiGLU 截断）.
+- Su et al. [RoFormer: Enhanced Transformer with Rotary Position Embedding](https://arxiv.org/abs/2104.09864). 2021.

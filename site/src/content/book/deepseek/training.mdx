@@ -1,0 +1,146 @@
+---
+title: 训练配方：从 GRPO 到 Sinkhorn 均衡更新
+description: 汇总 DeepSeek 各代在优化器、数值精度、负载均衡与后训练上的变化，并实现 V4.1 新增的 Sinkhorn 均衡更新、按头 Muon、按模态的路由偏置与可控推理强度的奖励。
+order: 9
+code:
+  - src/llms_from_scratch/deepseek/optim.py
+  - tests/deepseek/test_optim.py
+---
+
+前面八章几乎都在读推理代码。但一个结构能不能用，最终取决于它能不能被稳定地训练出来：MLA 要配合 FP8 训练，MoE 要配合负载均衡，压缩注意力要配合量化感知训练，Engram 的 196B 参数要找到一个不让优化器状态爆炸的更新规则。本章把 DeepSeek 各代的训练侧变化放在一张表里，然后实现 V4.1 技术报告 §2.5 与 §5.1.4 中新出现的四个部件。训练方法本身的原理分散在第五到第七部分：[优化器：从 SGD、Adam 到 Muon](/pretraining/optimizers/)、[混合精度训练：从 FP16 到 FP8](/pretraining/mixed-precision/)、[GRPO 与推理模型](/post-training/grpo/)、[大规模强化学习的工程与改进](/post-training/rl-at-scale/)。
+
+## 各代训练侧的变化
+
+| | V2（2024） | V3 / R1（2024—2025） | V4（2026） | V4.1（2026） |
+| --- | --- | --- | --- | --- |
+| 矩阵参数优化器 | AdamW | AdamW | Muon（其余 AdamW） | 按头 Muon（Q、K） |
+| 嵌入与输出头 | AdamW | AdamW | AdamW | 动量 + Sinkhorn 均衡 |
+| 训练精度 | BF16 | FP8 块量化 | FP8；专家与索引器 FP4 QAT | 另加主 KV FP4 QAT |
+| 负载均衡 | 专家、设备、通信三种辅助损失 | 偏置均衡 + 极小的序列级损失 | 偏置均衡；前 3 层哈希路由 | 文本、图像两组偏置 |
+| 附加目标 | — | MTP | MTP | 不用 MTP，事后训练 DSpark |
+| 预训练 token | 8.1T | 14.8T | 32T+ | 45T（多模态） |
+| 后训练 | SFT + RL | R1：GRPO 大规模 RL；蒸馏到小模型 | 领域专家（SFT + GRPO）再在线蒸馏合并 | SFT → RL → 在线蒸馏；可控推理强度；异步 RL |
+
+几条主线值得点出。**优化器**从 AdamW 走向 Muon，V4.1 又把 Muon 的“一个矩阵一个预条件子”细化到“一个头一个”，并为最大的几类矩阵换上了只需一个动量缓冲的更新。**精度**从 BF16 一路降到 FP4，降的对象从权重扩展到 KV 缓存，手段始终是量化感知训练：训练时就让模型看到部署时的数值格式。**负载均衡**从辅助损失走向几乎无损失的偏置调整，V4 的哈希路由与 V4.1 的按模态偏置都是在这个框架里打补丁。**后训练**的算法从 V3/R1 起就以 GRPO 为核心，V4.1 的报告明确说“后训练没有算法上的创新”，变化全部在数据与基础设施：大规模自动合成智能体任务与环境、异步 rollout、在线蒸馏。
+
+V4.1 预训练的超参数也值得记下来：批大小始终为 1.006 亿 token；学习率在前 2000 步线性预热到 $2.6\times10^{-4}$，保持到 28T token，在 28T—40T 间按余弦降到 $2.6\times10^{-5}$，之后保持到 45T；稀疏注意力**从零开始**以 64K 序列长度训练，没有 V3.2 那样的稠密预热阶段，在 34T 时把序列扩展到 1M；负载均衡偏置的更新速度为 0.001，另保留权重 $10^{-4}$ 的序列级均衡损失，防止单条序列内的极端不均衡。
+
+<Plot label="DeepSeek-V4.1-Flash 预训练的学习率调度" x={[0, 45]} y={[0, 3]} xLabel="已训练 token（T）" yLabel="学习率（×1e-4）" series={[
+  { fn: (t) => t < 0.2 ? 2.6 * t / 0.2 : t < 28 ? 2.6 : t < 40 ? 0.26 + (2.6 - 0.26) * 0.5 * (1 + Math.cos(Math.PI * (t - 28) / 12)) : 0.26, label: '学习率', tone: 'accent' },
+]}>
+  <Fragment slot="caption">2000 步预热约对应前 0.2T token（2000 × 1.006 亿）。28T 之前保持峰值，28T—40T 余弦衰减到峰值的 1/10，最后 5T 保持低学习率。34T 处序列长度从 64K 扩展到 1M，发生在衰减阶段之内。</Fragment>
+</Plot>
+
+## Sinkhorn 均衡更新
+
+V4.1 的嵌入表、输出头与 Engram 表合计有两千多亿参数。若用 Adam，每个参数还要两份优化器状态（一阶、二阶矩），仅 Engram 就要多出约 400B 个数。Muon 只需要一个动量缓冲，但它的 Newton–Schulz 正交化对这种行数巨大（词表大小或 1600 万行）、列数只有几千的矩阵并不合适，而且嵌入表的梯度极其稀疏：一个批次只触及很少的行。
+
+V4.1 的做法沿用 Muon 的流程，只把正交化换成 **Sinkhorn 均衡**：对 Nesterov 动量 $\hat G_t$，交替地把每一行、每一列除以各自的 $\ell_2$ 范数，迭代 $K$ 次，使更新矩阵的行 RMS 与列 RMS 都约为 1：
+
+<KeyEq label="Sinkhorn 均衡更新">
+
+$$
+\Delta_t=\sqrt n\,D_r\hat G_tD_c,\qquad
+\frac1n\sum_{j=1}^n(\Delta_t)_{ij}^2\approx1,\quad
+\frac1m\sum_{i=1}^m(\Delta_t)_{ij}^2\approx1 .
+$$
+
+</KeyEq>
+
+$D_r$、$D_c$ 是迭代累积出的对角缩放，$m$ 是行数（token 或 $n$-gram 的个数），$n$ 是隐藏维。一行对应一个 token 或一个 $n$-gram，一列对应一个隐藏特征，行列各自归一化恰好利用了这个“token × 特征”的结构。
+
+<CodeFile path="src/llms_from_scratch/deepseek/optim.py" region="sinkhorn_update" />
+
+实现与报告的算法 1 逐行对应。几个细节：$K$ 取奇数（V4.1 用 11），保证最后一步是行归一化，于是每行的 $\ell_2$ 范数恰为 1，乘 $\sqrt n$ 后行 RMS 恰为 1；列只是近似均衡。范数小于平均行范数 $\tau=10^{-3}$ 倍的行被直接置零——这些行几乎没有收到梯度（本批没出现的低频 token），若参与归一化，会被放大成和常见 token 一样大的更新。最后学习率乘 $\gamma=0.18$，让更新幅度与 Adam 相当（Moonlight 用 0.2，原理相同），于是可以沿用 AdamW 的学习率；Engram 的学习率再乘 5。
+
+测试 `test_sinkhorn_balance_equalizes_row_and_column_rms` 构造了一个行、列尺度都极不均匀的梯度（行尺度相差上千倍），均衡后非屏蔽行的 RMS 精确为 1，列 RMS 在 1 附近 10% 以内，近零行被置零。`test_update_step_is_bounded_and_uses_nesterov_momentum` 检查一步更新后动量与更新 RMS（约为 $\gamma$）。
+
+Sinkhorn 均衡与 Adafactor（用行、列二阶矩的外积近似完整二阶矩）、Adam-mini（对嵌入与输出头按行归一化）同属“利用矩阵轴结构”的一类优化器。它与 mHC 中把混合矩阵投影成双随机矩阵用的是同一个算法（[残差流的扩展：Hyper-Connections 与 mHC](/architecture/residual-streams/)），只是那里归一化的是和，这里归一化的是 $\ell_2$ 范数。
+
+## 按头 Muon
+
+Muon 把一个权重矩阵的更新正交化：$\Delta=\operatorname{NS}(\hat G)\approx UV^\top$。把 Muon 看作带预条件的梯度下降，它对整个矩阵用同一个预条件子。但查询与键的投影矩阵按输出维被切成了 64 个头，不同头的梯度尺度与谱结构可能差别很大，一个头的大奇异值会主导整个矩阵的正交化。按头 Muon 先把 `wq`、`wk` 的权重按头切开，每个头单独正交化：
+
+<CodeFile path="src/llms_from_scratch/deepseek/optim.py" region="headwise" />
+
+测试 `test_headwise_orthogonalization` 验证第 2 个头的结果等于对它单独做 Newton–Schulz，而整体结果与对整个矩阵做一次正交化不同。报告指出按头 Muon 优于普通 Muon，GLM-5 与 Kimi K3 的报告中也有相同的观察。
+
+## 按模态的无辅助损失均衡
+
+V3 的无辅助损失均衡为每个专家维护一个偏置：负载高于平均的专家偏置减小，低于平均的增大，偏置只影响“选谁”，不影响权重（[混合专家 MoE](/architecture/moe/)）。V4.1 是原生多模态模型，图像 token 与文本 token 的表示分布不同，对专家的偏好也不同。若只均衡总负载，可能出现“文本 token 集中在一半专家、图像 token 集中在另一半”，总体看似均衡，各模态内部却严重失衡。V4.1 为两种模态各维护一组偏置，路由时按 token 的模态选用（官方推理代码中的 `bias` 与 `bias_vl`），训练时各按本模态的负载更新。
+
+<CodeFile path="src/llms_from_scratch/deepseek/optim.py" region="modal_bias" />
+
+测试 `test_modal_bias_balances_each_modality_separately` 构造了“文本只用专家 0、1，图像集中在专家 2”的批次：文本偏置压低专家 0、抬高从未被文本选中的专家 2，图像偏置则压低专家 2。
+
+## 可控的推理强度
+
+V4.1 支持一个 1—100 的整数“推理强度”$b$，作为系统提示的一部分：强度越高，模型思考得越充分、输出越长。这是在 RL 中训练出来的。对每个训练 prompt $x$，在一组强度 $\mathcal B$ 上各采样 $M_b$ 个回答；同一 $(x,b)$ 的回答构成一个子组，在子组内减均值计算 GRPO 的组相对优势，**不同强度的回答互不比较**。强度的差异完全通过奖励中的长度惩罚产生：
+
+$$
+r^{\text{len}}_{b,j}=-\min\Big(C_{\max},\ k(b)\,\frac{\ell_{b,j}}{L_{\text{norm}}}\Big),\qquad
+k(b)=k_0\exp\Big(-\frac{b-b_{\min}}{\tau}\Big),
+$$
+
+$\ell_{b,j}$ 是推理 token 数，$\tau=\lambda\Delta b$ 与训练强度之间的平均间隔成正比。$b$ 每增加 $\tau$，惩罚系数乘以 $e^{-1}$：低强度下长度被重罚，模型学会简短作答；高强度下几乎不罚，模型可以充分思考。
+
+<CodeFile path="src/llms_from_scratch/deepseek/optim.py" region="effort" />
+
+测试 `test_effort_penalty_decays_exponentially_and_groups_by_effort` 验证了指数衰减，以及“同样答对时，低强度下短回答的优势更大，高强度下长短差别很小”，且每个子组的优势之和为 0。部署时，公开 API 的 max、high、low 三档分别对应 $b=100$、75、50；训练时只用了有限个强度，中间值在推理时也能插值出介于两者之间的行为。
+
+## 小结
+
+- 各代训练侧的主线：AdamW → Muon → 按头 Muon；BF16 → FP8 → FP4（权重、索引器、主 KV 依次 QAT）；辅助损失 → 偏置均衡 → 哈希路由与按模态偏置；后训练以 GRPO 为核心，V4 起用在线蒸馏合并领域专家。
+- V4.1 预训练 45T 多模态 token，批 1.006 亿 token，稀疏注意力从零以 64K 训练、34T 时扩展到 1M；学习率保持峰值到 28T，余弦衰减到 40T。
+- Sinkhorn 均衡更新：Nesterov 动量后交替做行、列 $\ell_2$ 归一化（$K=11$），屏蔽近零行，乘 $\sqrt n$ 与 $\gamma=0.18$；用于嵌入、输出头与 Engram 表，只需一个动量缓冲。
+- 按头 Muon 为每个注意力头单独正交化；文本与图像各一组路由偏置，各按本模态负载更新。
+- 可控推理强度：按 $(x,b)$ 子组计算优势，长度惩罚系数随 $b$ 指数衰减；API 三档对应 $b=100/75/50$。
+
+## 练习
+
+1. 为什么 Sinkhorn 均衡要屏蔽近零行？如果不屏蔽，一个本批次没有出现的 token 的嵌入会怎样更新？
+
+<details>
+<summary>答案</summary>
+
+本批次没出现的 token，它的嵌入行梯度为 0，动量只剩历史的残留，范数很小。行归一化会把这一行除以它自己的小范数，放大成与常见 token 同样大小（行 RMS 为 1）的更新；这个更新的方向来自过时的动量甚至数值噪声。每一步都这样做，低频 token 的嵌入会被不断随机推动。屏蔽阈值 $\tau\bar\rho$ 让这些行本步不更新。
+
+</details>
+
+2. $K$ 为什么取奇数？若 $K$ 为偶数，最后一步是列归一化，会有什么不同？
+
+<details>
+<summary>答案</summary>
+
+奇数 $K$ 让最后一步是行归一化，每行 $\ell_2$ 范数精确为 1，乘 $\sqrt n$ 后行 RMS 精确为 1，即每个 token 的嵌入更新幅度严格一致；列只是近似均衡。若最后一步是列归一化，列 RMS 精确、行 RMS 近似，此时某些 token 的更新可能偏大或偏小。对嵌入表来说，控制每个 token 的更新幅度更重要。
+
+</details>
+
+3. 在可控推理强度的训练中，若把不同强度的回答放在同一组里计算组相对优势，会发生什么？
+
+<details>
+<summary>答案</summary>
+
+同一组里，低强度回答受到重罚、高强度回答几乎不罚，于是高强度回答的奖励系统性地更高，获得正优势；低强度回答获得负优势。模型学到的是“无论被要求什么强度，都写长回答”，强度条件失去作用。按 $(x,b)$ 分组后，比较只在同一强度内进行：低强度组里短回答胜出，高强度组里长度几乎不影响胜负，模型才能学会按 $b$ 调整长度。
+
+</details>
+
+4. V4.1 不再用 MTP 作为预训练的附加目标。从训练与推理两方面分析这一取舍。
+
+<details>
+<summary>答案</summary>
+
+训练上，MTP 的附加损失被认为能改善表示与数据效率，但也占用计算、让主干同时服务两个目标；V4.1 的主干只做下一个 token 预测，结构（CED、CSA2）更复杂，去掉 MTP 简化了训练。推理上，MTP-1 每步只能多猜一个 token，DSpark 一次给出 5 个位置并带置信度调度，线上相同吞吐下单用户速度提高 60%—85%；DSpark 可以在主干训练完成后单独训练，并在后训练中跟随策略更新。于是推理加速不再需要绑定在预训练目标上。
+
+</details>
+
+## 参考文献
+
+- DeepSeek-AI. [DeepSeek-V4.1-Flash 技术报告](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/DeepSeek_V41_Tech_Report.pdf). 2026（§2.1.1 多模态无辅助损失均衡，§2.5 优化与算法 1，§4.2.2 训练设置，§5.1.4 可控推理强度，§5.2 异步后训练）.
+- DeepSeek-AI. [DeepSeek-V4](https://arxiv.org/abs/2606.19348). 2026（Muon、FP4 QAT、领域专家与在线蒸馏）.
+- DeepSeek-AI. [DeepSeek-V3 Technical Report](https://arxiv.org/abs/2412.19437). 2024（无辅助损失均衡、FP8 训练、MTP）；[DeepSeek-V2](https://arxiv.org/abs/2405.04434). 2024（三种均衡损失）.
+- DeepSeek-AI. [DeepSeek-R1](https://arxiv.org/abs/2501.12948). 2025；Shao et al. [DeepSeekMath](https://arxiv.org/abs/2402.03300). 2024（GRPO）.
+- Jordan et al. [Muon: An optimizer for hidden layers in neural networks](https://kellerjordan.github.io/posts/muon/). 2024；Liu et al. [Muon is Scalable for LLM Training](https://arxiv.org/abs/2502.16982). 2025（Moonlight，更新 RMS 对齐 AdamW）.
+- Scetbon et al. Gradient Multi-Normalization for Stateless and Scalable LLM Training（SinkGD）. 2025.
+- Shazeer and Stern. [Adafactor: Adaptive Learning Rates with Sublinear Memory Cost](https://arxiv.org/abs/1804.04235). 2018；Zhang et al. [Adam-mini](https://arxiv.org/abs/2406.16793). 2025.
+- Wang et al. [Auxiliary-Loss-Free Load Balancing Strategy for Mixture-of-Experts](https://arxiv.org/abs/2408.15664). 2024.

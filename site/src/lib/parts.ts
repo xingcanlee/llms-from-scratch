@@ -8,10 +8,11 @@ export type PartId =
   | 'post-training'
   | 'gpu'
   | 'inference'
+  | 'deepseek'
 
 export type Part = {
   id: PartId
-  /** 第一部分 … 第九部分 */
+  /** 第一部分 … 第十部分 */
   numeral: string
   label: string
   summary: string
@@ -72,6 +73,12 @@ export const parts: Part[] = [
     numeral: '第九部分',
     label: '推理系统',
     summary: 'prefill 与 decode 的成本模型、PagedAttention、连续批处理、CUDA Graph、vLLM 架构、量化、投机解码与分布式推理。',
+  },
+  {
+    id: 'deepseek',
+    numeral: '第十部分',
+    label: 'DeepSeek 技术全景',
+    summary: '对照官方推理代码读懂 DeepSeek 从 V2 到 V4.1 的全部关键设计：MLA 与分组路由、DSA、压缩注意力、CSA2 与因果编码器—解码器、FP4 KV 与有界重放、Engram、mHC、DSpark 与训练配方。',
   },
 ]
 

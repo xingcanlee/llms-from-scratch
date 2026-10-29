@@ -1,0 +1,135 @@
+---
+title: V4.1 的 KV 系统：FP4 缓存、有界重放与持久化
+description: 890 字节背后的数值格式与系统决策：FP4 E2M1 主 KV 与单级 E4M3 缩放、MXFP4 索引器键，滑窗 KV 为什么不再落盘，以及编码器 SWA 有界重放如何把一次缓存未命中变成廉价的近似恢复。
+order: 6
+code:
+  - src/llms_from_scratch/deepseek/kv_cache.py
+  - tests/deepseek/test_kv_cache.py
+---
+
+上一章从结构上解释了 V4.1 为什么只需要 4 个 Full 层的全局 KV。本章讨论剩下的两个问题：这些 KV 用什么格式存，以及存在哪里、存多久。前者决定了每个条目是 356 字节而不是 651 字节；后者决定了一个智能体会话能不能在几天后命中前缀缓存、命中时要付出多少重算。V4.1 的报告把这两件事与结构设计放在同一个目标下：**持久化 KV 只有 V4 的 1/8**，其中约 2 倍来自“滑窗 KV 不再持久化”，约 4 倍来自全局 KV 本身的压缩。
+
+## 存储层级与两类 KV
+
+服务一个长上下文请求时，KV 分布在三级存储上：GPU 显存（HBM）放正在 decode 的请求，主机内存与 SSD 放可以被后续请求复用的前缀（见[KV Cache 管理：PagedAttention 与前缀缓存](/inference/paged-attention/)）。DeepSeek 的部署把持久化 KV 放在 SSD 上（基于 3FS 分布式文件系统），保留时间超过 72 小时，一个智能体隔天继续工作，仍能命中之前的前缀。
+
+V4 系列的每层都有两类 KV，它们的访问模式完全不同：
+
+| | 全局 KV（主 KV + 索引器键） | 滑窗 KV |
+| --- | --- | --- |
+| 大小 | 随序列长度线性增长 | 每层固定 $n_{\text{win}}=128$ 个 token |
+| 复用方式 | 任意长度的前缀都可以复用 | 只在会话内、下一轮开始前有用 |
+| 复用时间尺度 | 小时到天（长尾） | 分钟 |
+| 精确重建的代价 | 重新 prefill 整个前缀 | 重放 $L\times n_{\text{win}}$ 个 token |
+
+## FP4 主 KV
+
+V4 已经用量化感知训练（QAT）把索引器的查询与键训练成 FP4，用来加速打分、缩小索引器缓存。V4.1 把 QAT 扩展到主 KV。这里 FP4 的作用与权重量化不同：主 KV 不参与 FP4 矩阵乘（注意力前先反量化回 BF16），它只是为了省存储。正因为不需要硬件对这个格式有矩阵乘支持，V4.1 可以选一个精度更高、各硬件都能解码的格式。
+
+FP4 E2M1 有 1 位符号、2 位指数、1 位尾数，非负取值只有 8 个：
+
+$$
+\{0,\ 0.5,\ 1,\ 1.5,\ 2,\ 3,\ 4,\ 6\}.
+$$
+
+这么少的取值必须配合块缩放使用：一块通道共享一个缩放 $s$，存储 $\operatorname{round}(x/s)$。V4.1 比较了几种约 4 位的格式，最终选择**每 16 个通道一个 E4M3 缩放**：这是 NVIDIA 的 NVFP4 去掉第二级全局 FP32 缩放的版本。索引器沿用 OCP 标准的 MXFP4：每 32 个通道一个 E8M0 缩放，E8M0 只有指数，缩放只能是 2 的幂。
+
+<CodeFile path="src/llms_from_scratch/deepseek/kv_cache.py" region="fp4" />
+
+手算一个例子。一块 16 个通道的最大绝对值为 4.2，NVFP4 式缩放 $s=4.2/6=0.7$，用 E4M3 存储时 0.7 被舍入为 $0.6875$（E4M3 在 $[0.5,1)$ 区间的格距是 $2^{-4}=0.0625$）。某个通道的值 $x=1.9$，$x/s\approx2.76$，舍入到最近的 E2M1 取值 3，反量化为 $3\times0.6875=2.06$，误差 0.16。若用 MXFP4，缩放必须是 2 的幂且不小于 $4.2/6$，只能取 1；$x/s=1.9$ 舍入为 2，反量化为 2，误差 0.1——这个例子里 MXFP4 碰巧更准，但平均而言，较小的块（16 比 32）与带尾数的缩放让 NVFP4 式格式的误差更小。测试 `test_fp4_formats_values_and_error` 在随机矩阵上验证两种格式的误差都不超过块最大值的 1/3（E2M1 最大格距 2 的一半，乘以缩放 $\text{amax}/6$），并且主 KV 格式的总误差更小。
+
+**为什么可以去掉第二级缩放？** NVFP4 用两级缩放是为了覆盖很大的动态范围：E4M3 的缩放最大 448，乘以 E2M1 的最大值 6，单级格式能表示的最大幅值是 $448\times6=2688$。V4.1 的报告给出了一个简洁的论证：主 KV 是 RMSNorm 的输出，训练后 RMSNorm 权重的最大幅值约为 1，所以 512 维向量的 $\ell_2$ 范数不超过 $\sqrt{512}$；RoPE 是旋转，保持范数；任何一个通道的绝对值都不超过 $\ell_2$ 范数，即 $\sqrt{512}\approx22.6$，远小于 2688。训练中实际观测到的最大值约为 10。动态范围绰绰有余，第二级缩放只会让缓存布局更复杂。
+
+两个工程选择也写在报告里：在 RoPE **之后**量化（之前量化精度略好，但 decode 时多一次开销），RoPE 部分与非 RoPE 部分用同一格式；滑窗 KV 对量化更敏感，保留 FP8。
+
+<Diagram width={720} height={200} label="V4.1-Flash 一个全局 KV 条目的 356 字节">
+  <Box x={20} y={40} w={370} h={50} label="主 KV 数值：512 × E2M1" sub="256 字节" tone="accent" />
+  <Box x={400} y={40} w={60} h={50} label="缩放" sub="32 B" size="sm" tone="accent2" />
+  <Box x={470} y={40} w={180} h={50} label="索引器键：128 × E2M1" sub="64 字节" size="sm" tone="info" />
+  <Box x={660} y={40} w={50} h={50} label="缩放" sub="4 B" size="xs" tone="accent2" />
+  <Text x={240} y={120} label="主 KV：每 16 维一个 E4M3 缩放（32 个）" size="sm" />
+  <Text x={590} y={120} label="索引器键：每 32 维一个 E8M0（4 个）" size="sm" />
+  <Text x={360} y={170} label="288 + 68 = 356 字节；4 个 Full 层按压缩率折算后每 token 890 字节" size="sm" bold />
+  <Fragment slot="caption">一个条目由两部分组成：512 维 FP4 主 KV（数值 256 字节，加 32 个 E4M3 缩放）与 128 维 MXFP4 索引器键（数值 64 字节，加 4 个 E8M0 缩放）。与 V4 的主 KV 格式（448 维 FP8 + 7 字节缩放 + 64 维 BF16 = 583 字节）相比，主 KV 部分从 583 字节降到 288 字节。</Fragment>
+</Diagram>
+
+## 滑窗 KV 不再落盘
+
+V4 的部署把两类 KV 都放进持久化缓存：全局 KV 全量保存，命中时复用整个前缀；滑窗 KV 在两个位置各存一份快照——prompt 末尾与输出末尾——命中时可以从快照位置继续计算。报告指出，即使只在两个位置各存 $n_{\text{win}}$ 个 token，滑窗 KV 在 V4 的持久化缓存中仍占了**近一半**容量，尤其是在每轮输入很短的多轮会话中。
+
+这是因为全局 KV 是按 token 增长的（每 token 3.4 KiB），而一份滑窗快照是 $L\times n_{\text{win}}$ 个条目（43 层 × 128 个 token），与本轮的长度无关。一轮只追加几千个 token 时，两份快照的大小就与这一轮的全局 KV 相当。
+
+<CodeFile path="src/llms_from_scratch/deepseek/kv_cache.py" region="replay" />
+
+用这段代码估算一轮 4096 个 token 的会话：V4 写入 $4096\times3508.8+2\times43\times128\times583\approx14.4+6.4$ MB，滑窗快照约占 31%；V4.1 只写 $4096\times890\approx3.6$ MB，约为 V4 的 1/5.7。轮次越短，滑窗快照占比越高，这个倍数越接近报告中的 8 倍。测试 `test_replay_and_persistent_cache_accounting` 检查了这个比例。
+
+更重要的是访问模式不匹配：滑窗 KV 只在会话进行中、几分钟内有用，下一轮一开始就失效；而持久化缓存是按“至少保留 72 小时”设计的。把短命数据放进长期存储，既浪费容量，又挤占全局 KV 的命中率。V4.1 的部署因此改为：
+
+1. 滑窗 KV 不进入持久化缓存，改放在一个分布式内存池中，池子取每台机器 10% 的主机内存，条目只保留几分钟，过期立刻回收给新会话。容量小得多，但周转快，足以服务绝大多数正在进行的会话。
+2. 全局 KV 仍在持久化缓存中，保证至少 72 小时。
+3. 命中全局 KV、但滑窗 KV 已被回收的请求，用**编码器 SWA 有界重放**恢复。
+
+## 编码器 SWA 有界重放
+
+当一个请求命中了前缀的全局 KV、却找不到滑窗 KV 时，要怎样继续？精确的做法是重放：滑窗依赖逐层累积，第 $L$ 层的滑窗 KV 依赖第 1 层在前 $L\times n_{\text{win}}$ 个位置上的计算，所以要精确恢复全部层的滑窗状态，需要对最后 $L\times n_{\text{win}}$ 个 token 重新做一次前向。V4 的报告提出过这种“零滑窗缓存”的方案，但在生产中它的代价过高：43 层 × 128 = 5504 个 token 的完整前向，对一个只追加几百个 token 的请求来说太贵了。
+
+V4.1 的有界重放只重放缓存前缀的最后 $n_{\text{win}}$ 个 token，与未命中的新后缀一起处理：重放的 token 只重新生成滑窗 KV，不重算、也不覆盖已缓存的全局 KV；新后缀则同时生成全局 KV 与滑窗 KV。滑窗被截断在重放起点 $s$：位置 $i$ 的查询只读 $[\max(s,\,i-n_{\text{win}}+1),\,i]$。与上一章的解码器有界重放一样，恢复出的状态是近似的；报告的实验表明对回答质量几乎没有影响。
+
+这里有一个微妙的后果：新后缀的全局 KV 是在近似的滑窗状态下算出来的，于是它依赖于“缓存在哪个位置命中”，同一段文本在不同的命中位置下会得到数值上略有不同的全局 KV。系统接受了这种不确定性，换来的是一个关键的工程性质：**前缀缓存只依赖全局 KV**。缓存未命中滑窗 KV 不再是灾难性的（重算几千个 token），而是一次固定、廉价的重放（128 个 token）。
+
+结合 CED，V4.1 的推理系统实现了两条重放路径：编码器的有界重放用于恢复缓存，解码器的有界重放用于每次 prefill（上一章）。部署上还采用了 Encoder–Prefill–Decode（EPD）分离：视觉编码、prefill 与 decode 分别扩缩容、互相重叠（与[分布式推理：并行、PD 分离与大规模 MoE 服务](/inference/distributed-inference/)中的 PD 分离同理，只是多了视觉编码这一级）。报告还提到，绝大多数层（Reuse 模式的层）在 prefill 时只需执行 15 个 kernel、decode 时 11 个，这得益于 FlashMLA 的“RoPE—注意力—逆 RoPE—类型转换”融合 kernel 以及 DeepGEMM 中的 Mega-Gate、Mega-mHC、Mega-MoE 融合 kernel。
+
+## 小结
+
+- V4.1 的持久化 KV 约为 V4 的 1/8：全局 KV 本身约 1/4，再加上滑窗 KV 不再持久化（约 1/2）。
+- 主 KV 用 FP4 E2M1 + 每 16 维一个 E4M3 缩放（去掉第二级缩放的 NVFP4），在 RoPE 之后量化；索引器用 MXFP4；滑窗 KV 保留 FP8。
+- 单级缩放足够的论证：RMSNorm 后 512 维向量的单个通道不超过 $\sqrt{512}\approx22.6$，远小于 $448\times6=2688$。
+- 滑窗 KV 的复用时间是分钟级，与持久化缓存的 72 小时不匹配；V4.1 把它放进主机内存池并快速回收。
+- 编码器 SWA 有界重放只重放 $n_{\text{win}}$ 个 token（而非 $L\times n_{\text{win}}$）并截断滑窗，近似恢复缺失的滑窗状态，让前缀缓存只依赖全局 KV。
+
+## 练习
+
+1. 对一块 16 个通道、最大绝对值为 0.03 的数据，计算 NVFP4 式缩放（E4M3 存储）与 MXFP4 缩放各是多少。
+
+<details>
+<summary>答案</summary>
+
+NVFP4 式：$0.03/6=0.005$。E4M3 的最小正规数是 $2^{-6}\approx0.0156$，0.005 落在次正规数区间（格距 $2^{-9}\approx0.00195$），舍入为 $3\times2^{-9}\approx0.00586$，相对误差约 17%；块内最大值 $0.03/0.00586\approx5.1$ 舍入为 6，反量化为约 $0.035$，误差 17%。MXFP4：$2^{\lceil\log_2(0.005)\rceil}=2^{-7}\approx0.0078$，块内最大值 $0.03/0.0078=3.84\to4$，即 $0.03125$。这说明单级 E4M3 缩放在值很小时会进入次正规区，精度下降；主 KV 经过 RMSNorm，单位 RMS 附近的数值不会落入这一区间，这也是单级缩放适合它的原因之一。
+
+</details>
+
+2. 为什么报告选择在 RoPE 之后量化？如果在 RoPE 之前量化，decode 时要多做什么？
+
+<details>
+<summary>答案</summary>
+
+若缓存存的是 RoPE 之前的量化值，每次 decode 读出历史条目后都要先反量化、再对每个历史位置施加对应的旋转，然后才能做点积；历史有数十万条目时，这是一笔不小的开销。在 RoPE 之后量化，缓存里存的就是可以直接点积的值，读出后只需反量化。报告说 RoPE 之前量化精度只略好一点，不值得这笔开销。
+
+</details>
+
+3. 估算：一个 V4 会话共 20 轮，每轮追加 500 个 token，持久化缓存中滑窗快照与全局 KV 各占多少？
+
+<details>
+<summary>答案</summary>
+
+全局 KV：$20\times500\times3508.8\approx35.1$ MB。滑窗快照：若只保留最新一轮的两份快照，约 $2\times43\times128\times583\approx6.4$ MB；若每轮的快照都在 LRU 中保留（便于从任意轮重新生成），则为 $20\times6.4=128$ MB，是全局 KV 的 3.6 倍。短轮次多轮会话正是滑窗快照占比最高的场景，这与报告中“在每轮较短的多轮会话中开销尤其大”的描述一致。
+
+</details>
+
+4. 有界重放让同一段文本的全局 KV 依赖于命中位置。这会给“前缀缓存的命中判定”带来什么问题吗？
+
+<details>
+<summary>答案</summary>
+
+命中判定只比较 token 序列（前缀哈希），不比较 KV 数值，所以判定本身不受影响。影响在于：两个请求共享同一段新文本，若它们从不同位置命中缓存，算出的全局 KV 会有微小差别；之后谁的 KV 被写进持久化缓存，后续命中就复用谁的。这让服务结果不再是逐位确定的，但每一种结果都是模型在训练时适应过的近似状态。系统用这一点不确定性换来了不必持久化滑窗 KV。
+
+</details>
+
+## 参考文献
+
+- DeepSeek-AI. [DeepSeek-V4.1-Flash: Pushing the Limits of KV Cache Compression](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/DeepSeek_V41_Tech_Report.pdf). 2026（§2.4.4 FP4 主 KV，§3.2 推理系统，§3.2.1 持久化 KV 管理，§3.2.2 SWA 有界重放）.
+- DeepSeek-AI. [DeepSeek-V4](https://arxiv.org/abs/2606.19348). 2026（FP4 索引器 QAT 与零滑窗缓存）.
+- Rouhani et al. [Microscaling Data Formats for Deep Learning](https://arxiv.org/abs/2310.10537). 2023（OCP MX 格式，MXFP4）.
+- Alvarez et al. Introducing NVFP4 for Efficient and Accurate Low-Precision Inference. NVIDIA Technical Blog, 2025.
+- [deepseek-ai/3FS](https://github.com/deepseek-ai/3FS)：持久化 KV Cache 所在的分布式文件系统.
+- 官方推理代码：[DeepSeek-V4.1-Flash inference/model.py](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/inference/model.py)（`fp4_act_quant(latent, 16, True, scale_dtype=torch.float8_e4m3fn)`）.

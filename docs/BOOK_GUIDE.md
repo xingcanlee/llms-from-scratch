@@ -1,6 +1,6 @@
 # 写作与排版规范
 
-本书是一本层层递进的中文技术书，参考 Stanford CS336《Language Modeling from Scratch》的路线：数学 → PyTorch 与资源核算 → 从零实现 Transformer → 现代架构 → 预训练 → 分布式训练 → 后训练 → GPU 编程 → 推理系统。正文唯一来源是 `site/src/content/book/<part>/<slug>.mdx`；参考实现在 `src/llms_from_scratch/<part>/`，测试在 `tests/<part>/`。
+本书是一本层层递进的中文技术书，参考 Stanford CS336《Language Modeling from Scratch》的路线：数学 → PyTorch 与资源核算 → 从零实现 Transformer → 现代架构 → 预训练 → 分布式训练 → 后训练 → GPU 编程 → 推理系统 → DeepSeek 技术全景（对照官方源码的综合案例）。正文唯一来源是 `site/src/content/book/<part>/<slug>.mdx`；参考实现在 `src/llms_from_scratch/<part>/`，测试在 `tests/<part>/`。
 
 ## 1. 全书结构
 
@@ -15,6 +15,7 @@
 | `post-training` | 第七部分 后训练与对齐 | `llms_from_scratch.post_training` |
 | `gpu` | 第八部分 GPU 与 CUDA 编程 | `llms_from_scratch.gpu` |
 | `inference` | 第九部分 推理系统 | `llms_from_scratch.inference` |
+| `deepseek` | 第十部分 DeepSeek 技术全景 | `llms_from_scratch.deepseek` |
 
 - 部分的元数据在 `site/src/lib/parts.ts`。章节顺序只由 frontmatter 的 `order` 决定；全书章号（第 1 章……第 68 章）、节号（3.2）、图号（图 3-2）由站点自动生成。
 - 每个部分的 `index.mdx`（`order: 0`）是导读：这一部分解决什么问题、与前后部分的关系、阅读建议，末尾放 `<ChapterList part="…" />`。

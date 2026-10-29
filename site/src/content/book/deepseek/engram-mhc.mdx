@@ -1,0 +1,166 @@
+---
+title: Engram 与 Single-Pass mHC
+description: 读 DeepSeek-V4.1 官方的 engram.py：压缩词表、乘法—异或滚动哈希、互不相同的素数桶与按流门控；再读 mHC 的系数预测与 Sinkhorn kernel，以及把读入系数推迟一层换来的单遍融合。
+order: 7
+code:
+  - src/llms_from_scratch/deepseek/engram.py
+  - src/llms_from_scratch/deepseek/mhc.py
+  - tests/deepseek/test_engram.py
+  - tests/deepseek/test_mhc.py
+---
+
+前面四章都在讨论注意力。V4.1 的主干里还有两个作用于**残差流**的部件：Engram 往残差流里写入查表得到的记忆，mHC 决定残差流本身怎样在层与层之间传递。[残差流的扩展：Hyper-Connections 与 mHC](/architecture/residual-streams/)已经推导了 mHC 的双随机约束，并简要介绍了 Engram 的思想。本章读它们在 V4.1 官方代码中的实现：`inference/engram.py` 的哈希是怎样一步步算出来的，门控为什么要对点积开方；mHC 的系数从哪里来，Sinkhorn kernel 的每一步在做什么，以及 V4.1 为什么要把读入系数“推迟一层”。
+
+## Engram：记忆的稀疏访问
+
+Engram 的出发点是：许多知识是静态的、由局部 token 模式决定的——一个专有名词的后半部分、一个固定搭配、一段代码里常见的 API 调用。Transformer 没有“查表”这种原语，只能用好几层计算去“模拟检索”这些模式。MoE 让**计算**稀疏化，Engram 提出第二个稀疏轴：一张巨大的嵌入表，每个位置只按它前面的 $N$-gram 读几行。读哪几行只依赖输入 token，与模型的隐藏状态无关，所以可以在前向开始之前就算好，并从主机内存预取。
+
+V4.1-Flash 在第 1 层与第 14 层各放一个 Engram 模块，每个模块用 2、3、4-gram，每阶 8 个哈希头，每个头一张约 1600 万行、256 维的表。表的行数取互不相同的素数，一个模块的总行数为 384,006,168，乘以 256 维约 983 亿参数，两个模块合计约 196B。与之相比，整个主干是 552B。
+
+### 第一步：压缩词表
+
+哈希之前，先把 129280 个 token id 映射到一个更小的 id 空间：对每个 token 解码出文本，做 NFKC/NFD 规范化、去掉重音、转小写、把连续空白合并为一个空格，规范化后文本相同的 token 共用一个 id。于是 " The"、"the"、"THE" 哈希到同一组表行。V4.1 的压缩词表大小为 99092，官方代码在加载时会断言这个数，因为所有哈希乘子都由它导出，词表大小不对会悄悄地让整张表“换了地址”。
+
+### 第二步：滚动哈希与素数桶
+
+<CodeFile path="src/llms_from_scratch/deepseek/engram.py" region="hash" />
+
+对位置 $t$，取它本身与前面 $N-1$ 个压缩 id：$x_t,x_{t-1},\dots,x_{t-N+1}$。若回看越过了序列开头，或遇到了被标记为 DEAD 的位置（图像 token），从那里开始全部用 `pad_id` 填充，所以 $n$-gram 永远不会跨越图像或序列边界。每层有一组奇数乘子 $m_0,\dots,m_{N-1}$，哈希按“乘法后异或”滚动计算：
+
+$$
+h^{(2)}=(x_tm_0)\oplus(x_{t-1}m_1),\qquad h^{(n+1)}=h^{(n)}\oplus(x_{t-n}m_n),
+$$
+
+$h^{(n)}$ 是以 $t$ 结尾的 $n$-gram 的哈希。每个（阶 $n$，头 $j$）有自己的素数 $p_{n,j}$，桶号是 $h^{(n)}\bmod p_{n,j}$，再加上这个（阶，头）在整张表中的起始偏移。同一阶的 8 个头用 8 个不同的素数取模，相当于 8 个独立的哈希函数：两个不同的 $n$-gram 在一个头上碰撞的概率约为 $1/p$，在 8 个头上同时碰撞几乎不可能，后面的投影可以从 8 行中恢复出区分信息。
+
+<CodeFile path="src/llms_from_scratch/deepseek/engram.py" region="layout" />
+
+素数从词表大小（官方配置为 1600 万）往上逐个寻找，已经用过的跳过，所以所有（层，阶，头）的桶区间互不相交。乘子由种子 $10007\times\text{layer}$ 的随机数发生器生成，上界取 $\lfloor\text{int64}_{\max}/V_c\rfloor/2$，保证 $x\cdot m$ 不会溢出 int64，再乘 2 加 1 保证是奇数（奇数乘子在模 $2^{64}$ 下可逆，不丢信息）。
+
+测试 `test_hash_matches_bruteforce` 用纯 Python 整数重新算一遍某个位置的 6 个桶号（3 阶 × 2 头），与向量化实现逐个比较；`test_ngrams_never_cross_dead_tokens_or_sequence_start` 验证 DEAD 之后的位置得到的哈希与“从序列开头起算”完全相同，DEAD 之前的内容无论怎样改都不影响它们。
+
+### 第三步：查表与按流门控
+
+<CodeFile path="src/llms_from_scratch/deepseek/engram.py" region="module" />
+
+每个位置取出 $3\times8=24$ 行、每行 256 维，拼成 6144 维，经 `wkv` 投影成 $n_{hc}+1=5$ 个 $d$ 维向量：4 个键（每条 mHC 残差流一个）与 1 个共享的值。门控是残差流 $x_i$ 与对应键 $k_i$ 的点积，两边各自按 RMS 归一化：
+
+$$
+\delta_i=\frac{\sum_c x_{i,c}\,w_{i,c}\,k_{i,c}}{\sqrt d\cdot\operatorname{rms}(x_i)\operatorname{rms}(k_i)},\qquad
+g_i=\sigma\!\Big(\operatorname{sign}(\delta_i)\sqrt{|\delta_i|}\Big),
+$$
+
+然后 $x_i\leftarrow x_i+g_i\,v$。若 $w=1$，$\delta_i$ 就是 $x_i$ 与 $k_i$ 的余弦相似度乘以 $\sqrt d$，取值范围约为 $[-\sqrt d,\sqrt d]$；带符号的开方把它压缩到 $[-d^{1/4},d^{1/4}]$，避免 sigmoid 饱和，与训练 kernel 的做法一致。门控的含义是：只有当检索到的内容与当前残差流“相关”时才写入，哈希碰撞或与上下文无关的记忆会被关掉。测试 `test_engram_gate_and_mask` 验证 4 条流写入的是同一个值、方向完全一致，只是门的大小不同；`token_mask` 为假的位置（图像 token）原样通过。
+
+V4.1 对原始 Engram 做了两处修改：去掉了门控后的短因果卷积（收益不足以抵消推理栈的复杂度），以及用“动量 + Sinkhorn 均衡”代替 Adam 来更新这些巨大的表（见[训练配方：从 GRPO 到 Sinkhorn 均衡更新](/deepseek/training/)）。部署时，表按行切分在各个 rank 上（`ParallelEngramEmbedding`：本 rank 之外的行先读 0 行再置零，最后 all-reduce），也可以放在主机内存中：由于地址只依赖 token，第一个模块的预取可以与第一个 Transformer 块的计算重叠。
+
+## mHC 的官方实现
+
+V4 引入 mHC 时用的是论文中的形式（第 $l$ 个块）：
+
+$$
+X_{l+1}=B_lX_l+C_l\,F_l(A_lX_l),\qquad (A_l,B_l,C_l)=\mathcal H(X_l),
+$$
+
+$X_l\in\mathbb R^{n\times d}$ 是 $n=4$ 条残差流，$A_l\in\mathbb R^{1\times n}$ 把它们混合成子层输入（读），$C_l\in\mathbb R^{n\times1}$ 把子层输出写回各条流（写），$B_l\in\mathbb R^{n\times n}$ 是流间混合，被约束为双随机矩阵。三组系数都是逐 token 由 $X_l$ 预测的。每个 Transformer 块有两个子层（注意力、FFN），各自有一组系数。
+
+### 系数从哪里来
+
+$\mathcal H$ 包含归一化与投影：把 $n\times d$ 的残差流展平成 $nd$ 维，乘一个 $(2+n)n\times nd$ 的矩阵 `hc_fn`，得到 24 个原始系数（4 个 pre、4 个 post、16 个 comb）。官方把 RMSNorm 的权重离线折进了 `hc_fn`，于是可以**先投影、后除以 RMS**——这个顺序对后面的单遍融合很重要。
+
+<CodeFile path="src/llms_from_scratch/deepseek/mhc.py" region="split_sinkhorn" />
+
+`hc_split_sinkhorn` 是官方 TileLang kernel 的逐步翻译。三组原始系数各乘一个可学习的标量 `hc_scale`，再加上一个可学习的偏置 `hc_base`：pre 取 $\sigma(\cdot)+\varepsilon$，落在 $(0,1)$；post 取 $2\sigma(\cdot)$，落在 $(0,2)$；comb 先按行做 softmax 再加 $\varepsilon$（于是一开始就是正的、行和为 1），然后列归一化一次，之后交替行、列归一化 19 轮，最后一步是列归一化。所以输出的列和精确为 1，行和近似为 1。这比[残差流的扩展：Hyper-Connections 与 mHC](/architecture/residual-streams/)中“先取指数再交替归一化”的写法多了一个 softmax，二者在数学上等价（softmax 就是取指数后做一次行归一化），只是数值上更稳定。测试 `test_split_sinkhorn_ranges` 检查了各系数的取值范围与 comb 的行列和。
+
+### Single-Pass mHC：把读入系数推迟一层
+
+把块边界处的计算按数据依赖拆开，V4 的实现分三个 kernel 顺序执行：
+
+$$
+X_l=B_{l-1}X_{l-1}+C_{l-1}Y_{l-1},\qquad (A_l,B_l,C_l)=\mathcal H(X_l),\qquad \hat X_l=A_lX_l ,
+$$
+
+其中 $Y_{l-1}$ 是上一个子层的输出，$\hat X_l$ 是本子层的输入。理想情况下，块边界只需读入 $X_{l-1}$（$nd$ 个数）与 $Y_{l-1}$（$d$ 个数），写出 $X_l$（$nd$）与 $\hat X_l$（$d$），即 $(2n+2)d$ 次激活读写。三个 kernel 分别读 $(n+1)d$、$nd$、$nd$，写 $(n+1)d$，加上子层内的 pre-norm，共 $(4n+4)d$，是下界的两倍。
+
+第一、二步可以融合：残差更新不需要跨隐藏维归约，每算出 $X_l$ 的一块就能立刻累加它对投影结果与平方和的贡献（这就是“先投影、后除以 RMS”的意义）。但第三步不行：$A_l$ 要等整个 $X_l$ 遍历完、归约结束才知道，于是必须第二次读 $X_l$。两遍实现需要 $(3n+2)d$。
+
+Single-Pass mHC 的做法是让每个子层使用**上一个子层**算出的读入系数：
+
+<KeyEq label="Single-Pass mHC">
+
+$$
+X_{l+1}=B_lX_l+C_l\,F_l\big(A_{l-1}X_l\big),\qquad (A_l,B_l,C_l)=\mathcal H(X_l).
+$$
+
+</KeyEq>
+
+$A_{l-1}$ 在处理 $X_l$ 之前就已知，于是遍历 $X_l$ 的每一块时，可以同时完成残差更新、读入混合，以及为下一个子层累加系数预测所需的量。部署用的 Mega-mHC kernel 把这三步与 pre-norm、FP8 转换融合成一个 kernel，残差只读一次、写一次，达到 $(2n+2)d$ 的下界，激活访存比 V4 的原始实现减半。报告说这个移位对模型效果的影响可以忽略；预训练时仍用多 kernel 实现，因为移位只改变“每个子层用哪组系数”。
+
+<Bars label="块边界的激活读写量（n = 4，单位：d 个元素）" items={[
+  { label: 'V4：三个 kernel', value: 20, tone: 'muted' },
+  { label: '两遍融合', value: 14, tone: 'info' },
+  { label: 'Single-Pass（Mega-mHC）', value: 10, tone: 'accent' },
+  { label: '理论下界', value: 10, tone: 'strong' },
+]}>
+  <Fragment slot="caption">$n=4$ 时下界为 $(2n+2)d=10d$，V4 的三 kernel 实现为 $(4n+4)d=20d$，两遍融合为 $(3n+2)d=14d$，Single-Pass 达到下界。每个 token 每个子层都要付这笔访存，mHC 的激活本来就是普通残差的 4 倍宽，它在 decode 时是不可忽略的带宽开销。</Fragment>
+</Bars>
+
+在官方代码中，这个移位体现在 `Block.forward` 的参数与返回值上：块接收 `pre_mix`（上一块 FFN 子层算出的读入系数），注意力子层用它读入，同时用 `hc_mixes` 算出自己的 `(attn_pre, attn_post, attn_comb)`；FFN 子层用 `attn_pre` 读入；块返回 FFN 子层算出的 `ffn_pre`，交给下一块。第一块之前的 `pre_mix` 是“只读第 0 条流”的独热向量（`make_identity_pre_mix`），最后一块之后，输出头用最后的 `pre_mix` 把 4 条流合成一条。
+
+<CodeFile path="src/llms_from_scratch/deepseek/mhc.py" region="stack" />
+
+测试 `test_single_pass_input_does_not_depend_on_own_pre_coefficients` 直接检验这个依赖关系：只扰动第 2 个子层的 pre 系数对应的投影行。原始 mHC 下，第 2 个子层看到的输入随之改变；Single-Pass 下，它看到的输入完全不变，变化推迟到第 3 个子层才出现。`test_traffic_formulas` 核对了四个访存公式之间的关系。
+
+## 小结
+
+- Engram 在 V4.1-Flash 的第 1、14 层各一个，2/3/4-gram × 8 头，表行数为互不相同的素数，合计约 196B 参数。
+- 哈希流程：压缩词表（规范化后相同的 token 合并）→ 回看 $N-1$ 个位置，越界或遇到图像 token 用 pad 填充 → 乘奇数乘子后滚动异或 → 对每个（阶，头）的素数取模并加偏移。
+- 门控：每条残差流与自己的键做双 RMS 归一化的点积，带符号开方后过 sigmoid；同一个值按各流的门写入。地址只依赖 token，可提前预取。
+- mHC 的系数由展平残差流的一次投影得到（归一化权重已折入，先投影后除 RMS）；comb 先行 softmax，再交替行列归一化共 20 轮，最后一步是列归一化。
+- Single-Pass mHC 让每个子层用上一个子层的读入系数 $A_{l-1}$，使残差更新、读入混合与系数预测能在一次遍历中完成，激活访存从 $(4n+4)d$ 降到下界 $(2n+2)d$。
+
+## 练习
+
+1. 为什么 Engram 的乘子必须是奇数？若某个乘子是偶数，会发生什么？
+
+<details>
+<summary>答案</summary>
+
+官方代码的上界保证 $x\cdot m$ 不会溢出，所以任何非零乘子都让 $x\mapsto xm$ 是单射，偶数乘子并不会让两个 token 的乘积相同。问题出在之后的异或：若 $m$ 是偶数（例如 $2^k$ 的倍数），这一项的最低 $k$ 位恒为 0，哈希值的这些位完全由其他项决定，这个位置的 token 对低位“没有贡献”；而取模 $p$ 的结果对所有位都敏感，低位缺少一部分来源会让桶的分布变差。奇数乘子保证每一项都影响最低位。官方注释只写了“Kept odd”，这是对这一选择的一种解释；乘法哈希的经典做法也使用奇数乘子，原因与此相同。
+
+</details>
+
+2. 证明：若所有子层的系数都与输入无关（`hc_fn = 0`）且彼此相同，Single-Pass 与原始 mHC 只在第一个子层不同。
+
+<details>
+<summary>答案</summary>
+
+`hc_fn = 0` 时系数只由 `hc_base` 与 `hc_scale` 决定，各子层的 $(A,B,C)$ 相同，记为 $(A,B,C)$。原始 mHC 中每个子层用 $A$ 读入；Single-Pass 中第 $i\ge2$ 个子层用前一个子层算出的 $A$，也是同一个 $A$。只有第一个子层用的是独热的 $e_0$ 而不是 $A$。所以二者只在第一个子层的读入上不同，若 $A=e_0$ 则完全相同。
+
+</details>
+
+3. Engram 的门控为什么对每条残差流分别计算，却写入同一个值？
+
+<details>
+<summary>答案</summary>
+
+mHC 的 4 条流在训练中会分化出不同的角色，某段记忆可能只与其中几条流的内容相关。分别计算门控让每条流自己决定接收多少；值共享则把查表结果的投影开销从 $4d$ 降到 $d$，同时保证写入的是同一份信息，只是强度不同。官方代码中 `wkv` 输出 $(n_{hc}+1)d$ 维正是这个设计的体现。
+
+</details>
+
+4. 估算 V4.1-Flash 中 Engram 的每 token 计算量，并与它的参数量对比。
+
+<details>
+<summary>答案</summary>
+
+每个模块每 token 读 24 行 × 256 维，查表本身几乎没有乘法；主要计算是 `wkv`：$6144\times5\times5120\approx1.57\times10^8$ 次乘加，两个模块约 $3.1\times10^8$，加上门控的点积可以忽略。参数量 196B 中真正参与这一 token 计算的只有 48 行嵌入（约 1.2 万个参数）和两个 `wkv` 矩阵（约 3.1 亿参数）。这正是“记忆稀疏”的含义：参数量可以很大，每 token 的计算与之几乎无关。
+
+</details>
+
+## 参考文献
+
+- Cheng et al. [Conditional Memory via Scalable Lookup: A New Axis of Sparsity for Large Language Models](https://arxiv.org/abs/2601.07372). ACL 2026；源码 [deepseek-ai/Engram](https://github.com/deepseek-ai/Engram).
+- Xie et al. [mHC: Manifold-Constrained Hyper-Connections](https://arxiv.org/abs/2512.24880). 2026.
+- DeepSeek-AI. [DeepSeek-V4.1-Flash 技术报告](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/DeepSeek_V41_Tech_Report.pdf). 2026（§2.4.1 Single-Pass mHC，§2.4.2 Engram，§3.1.3 Engram 的训练与推理）.
+- 官方推理代码：[DeepSeek-V4.1-Flash inference/engram.py](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/inference/engram.py)、[model.py](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/inference/model.py)（`Engram`、`Block`）与 [kernel.py](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/inference/kernel.py)（`hc_split_sinkhorn`）.
+- [deepseek-ai/DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)：Mega-mHC 等融合 kernel.

@@ -1,0 +1,144 @@
+---
+title: V3.2：闪电索引器与稀疏 MLA 的两种模式
+description: 读 DeepSeek-V3.2-Exp 官方代码中的 Indexer 与 MLA：索引器复用查询潜向量、Hadamard 旋转后再 FP8 打分，同一组 top-k 在 prefill 走 MHA 模式、在 decode 走 MQA 模式。
+order: 3
+code:
+  - src/llms_from_scratch/deepseek/dsa.py
+  - tests/deepseek/test_dsa.py
+---
+
+上一章看到，MLA 吸收之后每个 decode 查询读的是同一份 576 维缓存，缓存已经很小；但它仍然要读**全部**历史。128K 上下文时，每层每个查询要和 13 万个条目做点积。DeepSeek-V3.2 的回答是 DeepSeek 稀疏注意力（DSA）：用一个极便宜的“闪电索引器”给每个历史 token 打分，主注意力只在分数最高的 2048 个 token 上计算。[稀疏注意力：从 NSA、DSA 到压缩注意力](/architecture/sparse-attention/)已经推导了索引器的公式，并讲了“先稠密预热、再稀疏训练”的两阶段流程。本章读官方代码 `DeepSeek-V3.2-Exp/inference/model.py`，回答公式没有回答的问题：索引器的查询与键从哪里来，打分用什么精度，为什么要先做 Hadamard 旋转，主注意力怎样把 top-$k$ 用起来。
+
+V3.2 的主干与 V3.1-Terminus 完全相同（7168 维、61 层、128 头、256 个专家），唯一的结构改动就是给每个 MLA 层加了一个 `Indexer`：64 个索引头、头维 128、top-$k=2048$。
+
+## 一层 V3.2 注意力的数据流
+
+<Diagram width={720} height={300} label="DeepSeek-V3.2 一层注意力中索引器与 MLA 的数据流">
+  <Box x={20} y={120} w={80} h={50} label="x" sub="7168" />
+  <Box x={150} y={40} w={150} h={50} label="wq_a → q_norm" sub="qr：1536" mono />
+  <Box x={360} y={20} w={150} h={44} label="MLA 的 wq_b" sub="128 × 192" mono />
+  <Box x={360} y={80} w={150} h={44} label="索引器 wq_b" sub="64 × 128" mono tone="accent" />
+  <Box x={150} y={200} w={150} h={50} label="索引器 wk → LN" sub="128，所有头共享" mono tone="accent" />
+  <Box x={360} y={170} w={150} h={50} label="RoPE → Hadamard" sub="→ FP8" tone="accent" />
+  <Box x={560} y={110} w={140} h={60} label="top-2048" sub="ReLU 加权打分" tone="strong" />
+  <Box x={560} y={220} w={140} h={60} label="MLA 主注意力" sub="只在选中 token 上" tone="info" />
+  <Arrow from={[100, 140]} to={[150, 65]} />
+  <Arrow from={[100, 150]} to={[150, 225]} />
+  <Arrow from={[300, 58]} to={[360, 42]} />
+  <Arrow from={[300, 72]} to={[360, 100]} />
+  <Arrow from={[300, 225]} to={[360, 200]} />
+  <Arrow from={[510, 102]} to={[560, 130]} />
+  <Arrow from={[510, 195]} to={[560, 150]} />
+  <Arrow from={[630, 170]} to={[630, 220]} label="索引" />
+  <Arrow from={[510, 42]} via={[[540, 42], [540, 250]]} to={[560, 250]} tone="muted" />
+  <Fragment slot="caption">索引器的查询由 MLA 已经算好的查询潜向量 `qr` 再投影得到，不需要第二次读 `x` 的大矩阵；索引器的键直接由隐藏状态投影，所有索引头共用一个 128 维键并单独缓存。打分前 q、k 都经过 RoPE、Hadamard 旋转与 FP8 量化。选出的 2048 个位置变成一个掩码，加到 MLA 的注意力分数上。</Fragment>
+</Diagram>
+
+两个细节值得注意。第一，**查询复用 `qr`**。MLA 的查询本来就是两段式的：`wq_a` 把 7168 维压到 1536 维，`wq_b` 再展开成 128 个头。索引器的查询从这个 1536 维的 `qr` 出发，只需一个 $1536\to64\times128$ 的小矩阵，不必再从 7168 维的 $x$ 投影。第二，**键不复用潜向量**。V3.2 的索引器键由 `wk` 直接从 $x$ 投影得到，经 LayerNorm（不是 RMSNorm）后单独缓存，每 token 每层多 128 个 FP8 数加一个缩放。到了 V4.1 的 CSA2，索引器键改成从主 KV 条目投影得到，这个独立的路径才被去掉（见[V4.1：CSA2 与因果编码器—解码器](/deepseek/csa2-ced/)）。
+
+## 索引器：旋转、量化与 ReLU 打分
+
+<CodeFile path="src/llms_from_scratch/deepseek/dsa.py" region="indexer" />
+
+按官方代码的顺序：
+
+1. `q = wq_b(qr)`，`k = k_norm(wk(x))`，形状分别是 `[B, T, 64, 128]` 与 `[B, T, 128]`。
+2. 前 64 维加 RoPE。官方注释特别写明“rope in indexer is not interleaved”：索引器把向量的前半与后半配对旋转，而主注意力把相邻两维配对。两种布局只差一个固定的通道置换，移植沿用全书的相邻配对实现。
+3. `rotate_activation`：对 q 与 k 各乘一个归一化的 Hadamard 矩阵。
+4. 量化为 FP8（每 128 维一个缩放），键写入 FP8 缓存。
+5. `weights = weights_proj(x) · 64^{-1/2}`，再乘以查询的量化缩放与 $128^{-1/2}$，作为每个索引头的权重 $w_{t,h}$。
+6. `fp8_index` kernel 计算 $I_{t,s}=\sum_h w_{t,h}\operatorname{ReLU}(q_{t,h}\cdot k_s)$，加上因果掩码，取 top-2048。
+
+最后官方还有一行不起眼的检查：把 rank 0 的 top-$k$ 结果广播给所有 rank，断言各 rank 的结果相同。张量并行时每个 rank 都独立计算索引器（索引器的权重没有切分），浮点误差若让不同 rank 选出不同的 token，后面 all-reduce 的注意力输出就会对不上。
+
+### 为什么先做 Hadamard 旋转
+
+Hadamard 矩阵 $H_n$ 由 Sylvester 构造递归定义：$H_1=[1]$，$H_{2n}=\begin{bmatrix}H_n&H_n\\H_n&-H_n\end{bmatrix}$，除以 $\sqrt n$ 后是正交矩阵。正交变换不改变点积：
+
+$$
+(Hq)^\top(Hk)=q^\top H^\top Hk=q^\top k,
+$$
+
+所以对 q、k 同时旋转后，索引分数在不量化时完全不变。它改变的是**每个通道上数值的分布**。设一个向量只有一个通道是 8，其余为 0，旋转后 16 个通道的绝对值都是 $8/\sqrt{16}=2$：能量从一个通道均匀摊到了所有通道。量化时，一个块的缩放由块内最大值决定，摊平后最大值与均方根之比（峰均比）大幅下降，同样的位宽能更均匀地覆盖所有数值。
+
+<CodeFile path="src/llms_from_scratch/deepseek/dsa.py" region="hadamard" />
+
+测试 `test_hadamard_is_orthogonal_and_spreads_outliers` 验证了正交性、点积不变与上面的手算例子；`test_rotation_flattens_channel_distribution` 构造一个带离群通道的矩阵，旋转后平均峰均比降到原来的 1/4 以下。需要说明的是，FP8 E4M3 本身是浮点格式，自带指数位，对离群值并不像 INT8 那样敏感，旋转对 FP8 的收益有限；它在 V4 起把索引器降到 FP4 时才变得关键——FP4 E2M1 只有 8 个非负取值，峰均比稍大，块内的小数值就全被舍入成 0。
+
+### 为什么用 ReLU 而不是 softmax
+
+索引分数只用来排序，不需要归一化成概率；ReLU 让每个（查询，键，头）的贡献独立、非负，可以在任意分块顺序下累加，便于写成 FP8 GEMM 加逐元素操作的 kernel。权重 $w_{t,h}$ 由当前 token 决定，相当于让每个查询自己决定“相信哪几个索引头”。代价是 ReLU 会让大量分数恰好等于 0，top-$k$ 在零分之间的选择取决于实现；这一点在下一章的 CSA2 实现中会成为一个需要处理的细节。
+
+## 稀疏 MLA 的两种模式
+
+有了 top-$k$ 索引，主注意力怎样使用它？官方 V3.2 的 `MLA.forward` 按是否有因果掩码分成两条路径：
+
+<CodeFile path="src/llms_from_scratch/deepseek/dsa.py" region="sparse_mla" />
+
+- **MHA 模式（prefill）**：与 V3 的 naive 路径一样，用 `wkv_b` 把潜向量还原成每头 128 维键与 128 维值，在 192 维上算分数；然后构造一个 $T\times T$ 的掩码，只有 top-$k$ 位置为 0，其余为 $-\infty$，再与因果掩码相加。
+- **MQA 模式（decode）**：与 V3 的 absorb 路径一样，在 576 维上算分数、在 512 维潜空间里求和，同样加上 top-$k$ 掩码。
+
+两条路径选中的是同一组 token，数学上等价。测试 `test_mha_and_mqa_modes_agree` 在同一组权重上比较两种模式，结果一致；`test_topk_covering_all_tokens_is_dense_mla` 把 top-$k$ 设得比序列还长，验证稀疏 MLA 退化为 V3 的稠密 MLA。
+
+为什么 prefill 要换回 MHA 模式？prefill 时有 $T$ 个查询，计算量正比于“查询数 × 键数 × 点积维度”。MHA 模式点积 192 维、加权和 128 维，MQA 模式分别是 576 与 512 维，后者每对（查询，键）的计算多了约 3.4 倍。decode 时只有一个查询，瓶颈是读缓存，MQA 模式所有头共读一份 576 维缓存，读取量远小于 MHA 模式的 128 份。同一个模型在两个阶段选择不同的算法，这种“prefill 计算受限、decode 访存受限”的分析在[推理的成本模型：prefill 与 decode](/inference/inference-cost/)中有完整的推导。
+
+需要说明的是，参考实现用加性掩码表达稀疏：它仍然对全部 $T$ 个位置算分数，再把未选中的位置置为 $-\infty$。这只是为了可读，真正的加速来自 FlashMLA 的稀疏 kernel：只把 2048 个被选中的条目从显存读进来。
+
+## 代价与训练
+
+把索引器与主注意力的单位开销放在一起比较。对每个（查询，历史 token）对，索引器做 $64\times128=8192$ 次 FP8 乘加；吸收后的主注意力做 $128\times(576+512)=139264$ 次 BF16 乘加。索引器的计算约为主注意力的 1/17，且 FP8 的吞吐约是 BF16 的两倍。于是在 128K 上下文中，主注意力从读 131072 个条目降到 2048 个（1/64），索引器仍要扫描全部 131072 个，但它的单位成本小得多。V3.2 报告给出的结果是：长上下文下 prefill 与 decode 的单位 token 成本都明显下降，短上下文则几乎不变。
+
+索引器的训练分两个阶段，这在[稀疏注意力：从 NSA、DSA 到压缩注意力](/architecture/sparse-attention/)中已经讲过：先冻结主模型、在稠密注意力下用 KL 散度把主注意力的分布（对所有头求和后按行归一化）蒸馏给索引器，再切换到 top-2048 稀疏训练，此时索引器的输入从计算图中分离，只受 KL 损失驱动。`indexer_distill_target` 实现了这个目标分布。
+
+## 小结
+
+- V3.2 只给 V3.1-Terminus 的每个 MLA 层加了一个索引器：64 头、头维 128、top-2048。
+- 索引器的查询复用 MLA 的查询潜向量 `qr`，键由隐藏状态单独投影并缓存；前 64 维加非交错 RoPE。
+- 打分前对 q、k 做 Hadamard 旋转：正交变换保持点积，同时把离群通道摊平、降低峰均比，再量化为 FP8。
+- 分数 $I_{t,s}=\sum_h w_{t,h}\operatorname{ReLU}(q_{t,h}\cdot k_s)$ 只用于排序；张量并行时各 rank 独立计算并核对 top-$k$ 一致。
+- 同一组 top-$k$ 在 prefill 走 MHA 模式（192 维点积），在 decode 走 MQA 模式（576 维、共享缓存），二者数学等价。
+
+## 练习
+
+1. 证明：若对 q 与 k 只旋转其中一个，索引分数一般会改变；若对二者用**不同**的正交矩阵 $Q_1,Q_2$ 旋转呢？
+
+<details>
+<summary>答案</summary>
+
+只旋转 q：$(Hq)^\top k=q^\top H^\top k$，一般不等于 $q^\top k$。用不同的正交矩阵：$(Q_1q)^\top(Q_2k)=q^\top Q_1^\top Q_2k$，只有当 $Q_1^\top Q_2=I$，即 $Q_1=Q_2$ 时才对任意 q、k 保持点积。因此官方对 q 和 k 调用同一个 `rotate_activation`。
+
+</details>
+
+2. 一个 128 维向量只有一个非零通道，值为 $a$。经过归一化的 Hadamard 旋转后，各通道的绝对值是多少？峰均比从多少降到多少？
+
+<details>
+<summary>答案</summary>
+
+Hadamard 矩阵的每一列元素都是 $\pm1/\sqrt{128}$，所以旋转后每个通道的绝对值都是 $a/\sqrt{128}$。旋转前峰值为 $|a|$，均方根为 $|a|/\sqrt{128}$，峰均比 $\sqrt{128}\approx11.3$；旋转后所有通道相等，峰均比为 1。
+
+</details>
+
+3. 为什么张量并行时索引器的 top-$k$ 需要跨 rank 核对，而主注意力的 softmax 不需要？
+
+<details>
+<summary>答案</summary>
+
+主注意力按头切分，每个 rank 只算自己的头，结果通过 `wo` 的 all-reduce 合并，不同 rank 不需要一致的中间结果。top-$k$ 选择是离散的：若两个 rank 因为浮点累加顺序不同，在第 2048 名附近选出了不同的 token，它们各自的头就看到了不同的上下文，模型的语义被破坏而且不会报错。官方用广播加断言确保这种情况不会悄悄发生。
+
+</details>
+
+4. 估算 128K 上下文下，V3.2 每层每个 decode 查询的“索引器 + 主注意力”乘加数，与不加索引器的 V3 相比是多少？
+
+<details>
+<summary>答案</summary>
+
+V3：$131072\times139264\approx1.83\times10^{10}$。V3.2：索引器 $131072\times8192\approx1.07\times10^9$（FP8），主注意力 $2048\times139264\approx2.85\times10^8$，合计约 $1.36\times10^9$，约为 V3 的 7.4%；若把 FP8 按半价计，约为 4.5%。此时索引器反而成了主要开销，这正是 V4.1 引入分层稀疏索引器的动机。
+
+</details>
+
+## 参考文献
+
+- DeepSeek-AI. [DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models](https://arxiv.org/abs/2512.02556). 2025（§2 DSA 与两阶段训练）.
+- 官方推理代码：[deepseek-ai/DeepSeek-V3.2-Exp inference/model.py](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py)（`Indexer`、`rotate_activation`、`MLA.forward` 的 MHA/MQA 两条路径）.
+- [deepseek-ai/FlashMLA](https://github.com/deepseek-ai/FlashMLA)：稀疏 MLA 的 prefill 与 decode kernel；[deepseek-ai/DeepSelect](https://github.com/deepseek-ai/DeepSelect)：DSA 的 top-$k$ kernel.
+- Ashkboos et al. [QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs](https://arxiv.org/abs/2404.00456). 2024（用 Hadamard 旋转消除离群值以便低比特量化）.

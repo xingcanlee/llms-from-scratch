@@ -1,6 +1,6 @@
 # LLMs From Scratch
 
-一本层层递进的中文技术书：从链式法则与反向传播出发，亲手实现 Transformer，沿 2017—2026 年的架构演进走到 DeepSeek-V4，再讲清预训练、分布式训练、后训练与对齐，最后深入 GPU/CUDA 编程与 vLLM 式推理系统。路线参考 Stanford CS336《Language Modeling from Scratch》。
+一本层层递进的中文技术书：从链式法则与反向传播出发，亲手实现 Transformer，沿 2017—2026 年的架构演进走到 DeepSeek-V4，再讲清预训练、分布式训练、后训练与对齐，再深入 GPU/CUDA 编程与 vLLM 式推理系统，最后对照官方源码完整拆解 DeepSeek V2—V4.1 的核心技术。路线参考 Stanford CS336《Language Modeling from Scratch》。
 
 **在线阅读：<https://xingcanlee.github.io/llms-from-scratch/>**
 
@@ -15,6 +15,7 @@
 | 七、后训练与对齐 | SFT、LoRA、RLHF 与 PPO、DPO、GRPO 与推理模型、大规模 RL、蒸馏 |
 | 八、GPU 与 CUDA 编程 | GPU 架构、CUDA kernel、访存优化、归约与 GEMM、Triton、算子融合、FlashAttention、性能分析 |
 | 九、推理系统 | prefill/decode 成本模型、PagedAttention、连续批处理、CUDA Graph、vLLM、量化、投机解码、分布式推理、迷你推理引擎 |
+| 十、DeepSeek 技术全景 | 开源模型谱系与 KV 账本、V3 官方代码（MLA/分组路由/FP8）、V3.2 DSA、V4 压缩注意力、V4.1 CSA2 与因果编码器—解码器、FP4 KV 与有界重放、Engram 与 Single-Pass mHC、DSpark、训练配方 |
 
 ## 仓库结构
 

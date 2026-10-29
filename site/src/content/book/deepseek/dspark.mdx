@@ -1,0 +1,135 @@
+---
+title: DSpark：半自回归草稿与置信度调度
+description: DeepSeek 用 DSpark 取代 V3 以来的 MTP 草稿：一次前向并行给出一整块草稿，用低秩 Markov 头补上块内依赖，再用置信度头估计每个前缀的存活概率，按整批吞吐决定每个请求验证几个 token。
+order: 8
+code:
+  - src/llms_from_scratch/deepseek/dspark.py
+  - tests/deepseek/test_dspark.py
+---
+
+[多 token 预测](/architecture/multi-token-prediction/)介绍了 DeepSeek-V3 的 MTP 模块：它在预训练时作为附加目标，推理时作为投机解码的草稿模型，每步多猜 1 个 token。[投机解码](/inference/speculative-decoding/)推导了草稿—验证的接受规则与期望加速比。V3 到 V4 的线上服务一直用这种“MTP-1”。2026 年 6 月，DeepSeek 为 V4-Flash 与 V4-Pro 发布了附加 DSpark 模块的版本，V4 的正式版（0731、0813）与 V4.1-Flash 都自带 DSpark；V4.1 的预训练干脆不再包含 MTP。
+
+DSpark（Confidence-Scheduled Speculative Decoding with Semi-Autoregressive Generation）要解决的是并行草稿模型的两个问题。第一，一次前向并行预测整块 token 的草稿模型不建模块内 token 之间的依赖，越靠后的位置接受率下降得越快。第二，把整块草稿都送去验证，在高并发时会把批处理容量浪费在很可能被拒绝的 token 上。DSpark 用一个轻量的顺序模块解决前者，用一个置信度调度器解决后者。本章对照 V4.1 官方 `model.py` 中的 `DSparkBlock` 读它的结构，再实现一个简化的调度器。
+
+## 结构：并行主干加一个低秩 Markov 头
+
+<Diagram width={720} height={300} label="DSpark 草稿模块的数据流">
+  <Box x={20} y={30} w={190} h={56} label="目标模型层 37–39 的输入" sub="各取 4 条流的均值" tone="info" />
+  <Box x={250} y={30} w={140} h={56} label="main_proj → norm" sub="main_x" mono />
+  <Box x={20} y={130} w={190} h={56} label="[x_t, 噪声 × 4]" sub="block_size = 5" mono />
+  <Box x={250} y={130} w={200} h={56} label="3 个 DSpark 块" sub="滑窗注意力 + MoE（128 选 3）" tone="accent" />
+  <Box x={490} y={130} w={210} h={56} label="基础 logits" sub="5 个位置，一次前向" />
+  <Box x={490} y={220} w={210} h={56} label="Markov 头（秩 256）" sub="按上一个草稿 token 加偏置" tone="accent2" />
+  <Box x={250} y={220} w={200} h={56} label="置信度头" sub="[hidden; Markov 嵌入] → c_i" tone="strong" />
+  <Arrow from={[210, 58]} to={[250, 58]} />
+  <Arrow from={[320, 86]} to={[340, 130]} label="键值" />
+  <Arrow from={[210, 158]} to={[250, 158]} />
+  <Arrow from={[450, 158]} to={[490, 158]} />
+  <Arrow from={[595, 186]} to={[595, 220]} />
+  <Arrow from={[490, 248]} to={[450, 248]} />
+  <Fragment slot="caption">草稿模块读取目标模型三个深层的表示（`main_x`）作为键值，查询来自“当前 token + 4 个噪声 token”的嵌入。三个块一次前向给出 5 个位置的基础 logits；Markov 头在采样时按上一个草稿 token 给下一个位置加偏置，这是唯一的串行部分；置信度头为每个位置估计条件接受概率。</Fragment>
+</Diagram>
+
+对照官方代码看各部分：
+
+- **输入。** 主模型前向时，在第 37、38、39 层的**注意力输入**处取残差流（4 条 mHC 流取均值），拼成 $3\times5120$ 维，经 `main_proj` 与 `main_norm` 得到 `main_x`。草稿的输入 id 是一块 5 个：第一个是刚生成的 token，其余 4 个是固定的噪声 token（`dspark_noise_token_id`），嵌入后作为查询。
+- **注意力。** `DSparkAttention` 只有滑窗（`compress_ratio == 0`）：草稿块的查询看到的是 `main_x` 投影出的最近 128 个位置的键值（存在本层的环形缓冲区里），加上草稿块自己的 5 个位置。prefill 时它只负责把 `main_x` 写进窗口缓存。
+- **MoE。** 草稿块的专家更少：128 个路由专家选 3 个（主干是 384 选 6）。
+- **Markov 头。** 一个秩 256 的嵌入 `embed: V→256` 与输出 `head: 256→V`。采样第 $i$ 个草稿 token 时，把上一个 token 的嵌入经 `head` 得到的 logits 偏置加到第 $i$ 个位置的基础 logits 上。
+
+<CodeFile path="src/llms_from_scratch/deepseek/dspark.py" region="draft" />
+
+这就是“半自回归”：主干是并行的，一次前向算出所有位置的基础 logits；只有一个廉价的低秩循环是串行的，它把“上一个草稿 token 是什么”的信息补给下一个位置。测试 `test_markov_head_adds_dependency_on_previous_draft` 构造了一个极端例子：基础 logits 在每个位置都偏好 token 2，Markov 头编码“上一个是 2 就强烈偏好 5”，于是草稿变成 2、5、2、5，而不是纯并行草稿的 2、2、2、2。
+
+DSpark 的训练与 V3 的 MTP 不同：它不参与预训练。V4.1 先训练好主干，再单独训练 DSpark（主干冻结）；后训练期间 DSpark 继续随主干一起训练，但它的损失不向主干回传梯度。这样 DSpark 能跟上不断变化的策略模型，同时用于加速线上服务与 RL/OPD 的 rollout 生成。
+
+## 置信度调度
+
+置信度头为第 $i$ 个草稿位置输出 $c_i$：在前 $i-1$ 个草稿都被接受的条件下，第 $i$ 个被接受的概率。由此得到**前缀存活概率**
+
+$$
+S_j=\prod_{i\le j}c_i ,
+$$
+
+即前 $j$ 个草稿全部被接受的概率。若这一步验证前 $L$ 个草稿，得到的期望 token 数是
+
+<KeyEq label="验证 L 个草稿的期望产出">
+
+$$
+\mathbb E[\text{tokens}\mid L]=1+\sum_{j=1}^{L}S_j ,
+$$
+
+</KeyEq>
+
+“1”是目标模型在验证时总能自己产出的那个 token（第一个被拒绝位置的修正，或全部接受后的下一个 token）。这个公式也可以这样理解：第 $j$ 个草稿能贡献一个 token，当且仅当前 $j$ 个都被接受。测试 `test_expected_tokens_matches_monte_carlo` 用 20 万次模拟验证了它。
+
+$S_j$ 随 $j$ 单调递减，多验证一个 token 的边际收益越来越小，而代价是目标模型这一步要多处理一个 token。代价有多大取决于系统负载：批很小时 decode 受访存限制，多几个 token 几乎不增加耗时；批很大时 decode 已接近计算受限，每个 token 都要付出计算时间。DSpark 的调度器把每个请求的存活概率与引擎实测的吞吐曲线结合起来，为每个请求选择验证长度，目标是在当前负载下最大化整个系统的期望 token 吞吐。
+
+<CodeFile path="src/llms_from_scratch/deepseek/dspark.py" region="schedule" />
+
+移植实现的是一个简化版本。设一步验证 $n$ 个 token 的耗时为 $T(n)$（每个请求至少处理 1 个 token），目标是
+
+$$
+\max_{L_1,\dots,L_R}\ \frac{\sum_r\big(1+\sum_{j\le L_r}S_{r,j}\big)}{T\big(R+\sum_rL_r\big)} .
+$$
+
+固定总验证数 $n$ 时，分子最大的分配方式是把 $n$ 个名额依次给边际收益 $S_{r,j}$ 最大的位置；由于每个请求的 $S_{r,j}$ 单调递减，按全局降序贪心选取就是最优的。再在所有 $n$ 中选比值最大的一个。测试 `test_scheduler_matches_bruteforce` 在 3 个请求、每个最多 3 个草稿的情形下与穷举比较，结果一致；`test_scheduler_shortens_verification_under_load` 验证：负载轻（$T$ 几乎不随 $n$ 增长）时调度器验证得更多，负载重时验证得更少，而且置信度高的请求总是分到更长的验证。论文中的调度器还要处理吞吐曲线的分段特性、请求间的公平性与采样温度等因素，细节见参考文献。
+
+## 效果
+
+DSpark 论文报告，与当时最好的自回归与并行草稿方法相比，它在多个领域的离线基准上显著提高了接受长度；在 DeepSeek-V4 的线上服务中，与 MTP-1 基线相比，在相同吞吐下单用户生成速度提高了 60%–85%。V4-Flash-DSpark 的模型卡给出了在 vLLM 中启用的方式（`"method": "dspark"`，`num_speculative_tokens` 取 7）。DeepSeek 同时开源了 DeepSpec 代码库，以及为 Qwen3 与 Gemma 4 训练的 EAGLE-3、DFlash 与 DSpark 草稿模型，便于在其他模型上比较这几种方法。
+
+## 小结
+
+- DSpark 取代 MTP-1 作为 DeepSeek 的投机解码草稿：V4 正式版与 V4.1 都自带，V4.1 的预训练不再包含 MTP。
+- 结构：3 个滑窗注意力 + MoE（128 选 3）的块，读目标模型第 37–39 层的表示，一次前向给出 5 个位置的基础 logits；秩 256 的 Markov 头按上一个草稿 token 加偏置，是唯一的串行部分。
+- 置信度头估计条件接受概率 $c_i$，前缀存活概率 $S_j=\prod_{i\le j}c_i$，验证 $L$ 个草稿的期望产出为 $1+\sum_{j\le L}S_j$。
+- 调度器结合存活概率与引擎吞吐曲线，为每个请求选验证长度；负载越重，验证越短，高置信度的请求验证越长。
+- DSpark 在主干训练完成后单独训练，后训练时继续训练但不向主干回传梯度，同时加速服务与 RL rollout。
+
+## 练习
+
+1. 若一个草稿模块的每个位置的条件接受概率都是常数 $c$，验证 $L$ 个草稿的期望产出是多少？$L\to\infty$ 时呢？
+
+<details>
+<summary>答案</summary>
+
+$S_j=c^j$，期望产出 $1+\sum_{j=1}^Lc^j=1+c\frac{1-c^L}{1-c}=\frac{1-c^{L+1}}{1-c}$。$L\to\infty$ 时趋于 $\frac1{1-c}$。例如 $c=0.8$ 时上限是 5 个 token，验证 7 个草稿已经能拿到 $\frac{1-0.8^8}{0.2}\approx4.16$ 个，再多验证收益很小。这与[投机解码](/inference/speculative-decoding/)中的 $\frac{1-\alpha^{k+1}}{1-\alpha}$ 是同一个公式。
+
+</details>
+
+2. 为什么纯并行草稿的接受率会随位置迅速下降，而 Markov 头能缓解它？
+
+<details>
+<summary>答案</summary>
+
+并行草稿的第 $i$ 个位置只看到目标模型的表示与噪声 token，不知道前 $i-1$ 个位置实际采样出了什么。若前面某个位置在两个候选之间犹豫，后面的位置无法与之保持一致，常常给出与另一个候选衔接的 token（例如前一位选了“New”，后一位却按“San”的分布猜“Francisco”）。Markov 头把上一个草稿 token 作为条件，至少消除了相邻位置之间的这种不一致；它只是一阶依赖，但成本极低。
+
+</details>
+
+3. 在调度器中，若吞吐曲线是 $T(n)=1$（与 $n$ 无关），最优策略是什么？这对应什么场景？
+
+<details>
+<summary>答案</summary>
+
+分母不变，分子随验证长度单调不减，所以应当验证全部草稿（只要 $S_j>0$）。这对应批很小、decode 完全受访存限制的场景：多处理几个 token 不增加耗时，验证越多越好。高并发时 $T(n)$ 随 $n$ 增长，调度器才会截短验证。这也解释了为什么 DSpark 的收益常以“相同吞吐下的单用户速度”报告。
+
+</details>
+
+4. 为什么 DSpark 的损失不向主干回传梯度？
+
+<details>
+<summary>答案</summary>
+
+DSpark 读取主干的深层表示作为输入，若它的损失回传到主干，主干就会被拉向“让草稿更容易猜”的方向，这可能损害主干本身的语言建模或 RL 目标。V3 的 MTP 是作为附加训练目标设计的，有意让梯度影响主干以改善表示；DSpark 只是一个推理加速器，所以把它与主干解耦，主干的训练目标保持不变。
+
+</details>
+
+## 参考文献
+
+- Cheng et al. [DSpark: Confidence-Scheduled Speculative Decoding with Semi-Autoregressive Generation](https://arxiv.org/abs/2607.05147). 2026.
+- DeepSeek-AI. [DeepSeek-V4.1-Flash 技术报告](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/DeepSeek_V41_Tech_Report.pdf). 2026（§2.4.3 DSpark）.
+- 官方推理代码：[DeepSeek-V4.1-Flash inference/model.py](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/inference/model.py)（`DSparkAttention`、`DSparkMarkovHead`、`DSparkConfidenceHead`、`DSparkBlock`）；模型卡 [DeepSeek-V4-Flash-DSpark](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-DSpark).
+- [deepseek-ai/DeepSpec](https://github.com/deepseek-ai/DeepSpec)：投机解码算法的训练与评测代码库.
+- Li et al. [EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test](https://arxiv.org/abs/2503.01840). 2025.
+- Leviathan et al. [Fast Inference from Transformers via Speculative Decoding](https://arxiv.org/abs/2211.17192). 2023.

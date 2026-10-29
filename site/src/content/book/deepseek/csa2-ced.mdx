@@ -1,0 +1,184 @@
+---
+title: V4.1：CSA2 与因果编码器—解码器
+description: 读 DeepSeek-V4.1-Flash 官方代码：主 KV、索引器键与 top-k 索引怎样按 Full/Reindex/Reuse 三种模式跨层共享，分层稀疏索引器怎样把深层打分限制在常数大小的候选池，以及解码器的全局 KV 来自编码器输出如何让 prefill 计算减半。
+order: 5
+code:
+  - src/llms_from_scratch/deepseek/csa2.py
+  - tests/deepseek/test_csa2.py
+---
+
+V4 把每 token 的全局 KV 压到了约 3.4 KiB，但它仍然**每一层**都有自己的压缩 KV 与索引器。V4.1 的技术报告给出了一个很好的分析框架：降低 KV 的存储与读取，有三个可以相乘的维度。**条目大小**——GQA 减少 KV 头，MLA 与 V4 的共享 KV 让所有头共用一个小向量；**序列维**——V4 的 CSA/HCA 把每 $m$ 个 token 压成一个条目；**层维**——让一些层复用别的层的缓存与选择结果，而不是各存一份。前两个维度 V4 已经做到了，V4.1 的 CSA2（Compressed Sparse Attention 2）补上第三个维度。与此同时，因果编码器—解码器（Causal Encoder-Decoder，CED）让解码器一半层的全局 KV 都来自编码器的输出，从而在 prefill 时跳过大部分解码器计算。
+
+本章对照 `DeepSeek-V4.1-Flash/inference/model.py` 读这两个设计。移植在 `src/llms_from_scratch/deepseek/csa2.py`：它省略了 RoPE、MoE、mHC 与量化，只保留注意力的数据流，但层的模式、共享状态的读写顺序、分层索引器与 CED 的 prefill 路径都与官方一致。
+
+## 三种模式
+
+CSA2 的每一层都保留自己的查询和滑窗 KV，区别只在“全局分支”的三样东西从哪里来：主 KV、索引器键、top-$k$ 索引。
+
+| 模式 | 主 KV 与索引器键 | top-$k$ 索引 | 在官方 config 中的判定 |
+| --- | --- | --- | --- |
+| Full | 本层压缩并投影出来，发布给后续层 | 本层索引器计算 | 层号 ∈ `kv_source_layers` |
+| Reindex | 复用最近的 Full 层 | 本层用**自己的**索引器查询重新打分 | 层号 ∈ `index_source_layers`，但不是 kv 源 |
+| Reuse | 复用最近的 Full 层 | 复用最近一次计算的索引 | 其余压缩层 |
+
+官方代码没有一个叫“mode”的字段，模式是由三个列表推出来的：`compress_ratios`（每层的压缩率，0 表示只有滑窗）、`kv_source_layers` 与 `index_source_layers`。移植用一个函数把这条规则写清楚：
+
+<CodeFile path="src/llms_from_scratch/deepseek/csa2.py" region="modes" />
+
+把 V4.1-Flash 的官方配置代进去（`compress_ratios` 为 2 个 0、18 个 2、20 个 1；`kv_source_layers = [2, 8, 14, 20]`；`index_source_layers` 再加上 24、28、32、36），得到下面的结构，测试 `test_official_v41_flash_mode_assignment` 逐层核对了它：
+
+<Diagram width={720} height={270} label="DeepSeek-V4.1-Flash 40 层的 CSA2 模式分配">
+  <Region x={10} y={20} w={350} h={190} title="因果编码器（层 0–19，m = 2）" />
+  <Region x={370} y={20} w={340} h={190} title="解码器（层 20–39，m = 1）" />
+  <Box x={25} y={55} w={50} h={36} label="SWA" sub="0, 1" size="sm" tone="muted" />
+  <Box x={85} y={55} w={80} h={36} label="Full" sub="2" size="sm" tone="accent" />
+  <Box x={170} y={55} w={175} h={36} label="Reuse × 5" sub="3–7" size="sm" />
+  <Box x={85} y={100} w={80} h={36} label="Full" sub="8" size="sm" tone="accent" />
+  <Box x={170} y={100} w={175} h={36} label="Reuse × 5" sub="9–13" size="sm" />
+  <Box x={85} y={145} w={80} h={36} label="Full" sub="14" size="sm" tone="accent" />
+  <Box x={170} y={145} w={175} h={36} label="Reuse × 5" sub="15–19" size="sm" />
+  <Box x={385} y={55} w={110} h={36} label="Full + 候选池" sub="20" size="sm" tone="strong" />
+  <Box x={505} y={55} w={190} h={36} label="Reuse × 3" sub="21–23" size="sm" />
+  <Box x={385} y={100} w={110} h={36} label="Reindex" sub="24, 28, 32, 36" size="sm" tone="info" />
+  <Box x={505} y={100} w={190} h={36} label="Reuse × 3（每组）" sub="25–27 … 37–39" size="sm" />
+  <Text x={540} y={170} label="主 KV 全部来自层 20" size="sm" tone="accent" />
+  <Text x={540} y={192} label="层 20 的输入 = 编码器输出" size="sm" tone="accent" />
+  <Text x={360} y={245} label="只有 4 个 Full 层产生全局 KV：每 token 3 × 356 / 2 + 356 = 890 字节" size="sm" bold />
+  <Fragment slot="caption">编码器分三组，每组一个 Full 层产生 $m=2$ 的主 KV，供本组后 5 个 Reuse 层使用。解码器只有层 20 是 Full：它产生 $m=1$（不压缩）的主 KV 与候选池；层 24、28、32、36 是 Reindex，在共享的主 KV 上重新选 top-512；其余是 Reuse。所有 40 层都保留自己的查询与 128 个 token 的滑窗。</Fragment>
+</Diagram>
+
+这个配置里藏着一个设计判断：编码器压缩率 2、6 层共享一份；解码器不压缩、20 层共享一份，但每 4 层重新索引一次。解码器离输出近，对全局信息的精度要求更高，所以不压缩；而“同一份 KV、不同的选择”让深层可以关注与浅层不同的位置，又不增加存储。
+
+## CSA2 对 CSA 的简化
+
+除了跨层共享，CSA2 还简化了 V4 的两个部件。**压缩器**去掉了重叠窗口与组内位置偏置：每个条目只汇聚本组 $m$ 个 token，压缩率为 1 时退化成一次投影加 RMSNorm。**索引器键**不再从隐藏状态单独压缩一路，而是由主 KV 条目再投影得到（`wk: head_dim → index_head_dim`）。报告说这两项简化让实现更简单、训练更快。
+
+<CodeFile path="src/llms_from_scratch/deepseek/csa2.py" region="compressor" />
+
+## 共享状态：源层先写，消费层后读
+
+跨层共享在代码里怎样实现？官方用一个模块级的单例 `shared_attn = SharedAttentionRuntime()`，只有四个槽：`compress_kv`、`index_k`、`topk_idxs`、`candidates`。层按顺序执行，每个源层在本层的前向里写槽，后续层读槽，所以每种状态只需要一个槽，两次前向之间也不用清空。移植把它写成显式传递的 `SharedState`。
+
+<CodeFile path="src/llms_from_scratch/deepseek/csa2.py" region="attention" />
+
+逐行对照官方的 `Attention.forward` 与 `_compress_kv`：
+
+1. 每层都计算自己的查询，并把自己的滑窗 KV 写进本层缓存。滑窗位置是 $[\max(p-W+1,\ \text{window\_start}),\ p]$，`window_start` 在正常前向中为 0，在下文的有界重放中是重放起点。
+2. 若是 Full 层，`produce_global_kv`：压缩器输出新完成的条目（可能没有），写入本层的主 KV 缓存，并投影出索引器键；然后把两份缓存的引用发布到共享状态。
+3. 若有索引器（Full 或 Reindex），用本层的索引器查询在共享的索引器键上打分，选出 top-$k$，写入 `topk_idxs`；Reuse 层直接读这个槽。
+4. 把滑窗 KV 与共享主 KV 沿序列维拼接，压缩部分的索引加上偏移量（滑窗部分的长度），交给 `sparse_attn`。
+
+官方代码中有一个顺序上的细节：索引器键必须在主 KV **加 RoPE 与量化之前**从潜向量投影出来，因为二者共用同一块存储，主 KV 随后会被原地旋转并量化为 FP4。移植没有 RoPE，但保留了“先投影索引器键、再写主 KV 缓存”的顺序。
+
+<CodeFile path="src/llms_from_scratch/deepseek/csa2.py" region="indexer" />
+
+测试 `test_prefill_equals_token_by_token_decode` 对一个 8 层的小模型（1 个滑窗层、3 个 $m=2$ 的编码器层、4 个 $m=1$ 的解码器层，包含 Full、Reindex、Reuse 三种模式），分别用 1、6、11 个 token 做 prefill，其余逐 token decode，所有位置的 logits 与一次 prefill 完全相同。这条测试在第一版实现时失败了，原因很有教益：索引分数里有 ReLU，小模型只有 2 个索引头，许多（查询，条目）对的分数恰好是 0；`torch.topk` 在平分时的选择依赖于输入的宽度，prefill 时一行有 11 个候选，decode 时只有 3 个，选出了不同的零分条目。移植改用稳定排序，平分时取较早的位置。官方代码用 `topk(sorted=False)`，平分时的选择同样不确定，但它有 32 个索引头，整行恰好平分几乎不会发生。
+
+## 分层稀疏索引器
+
+跨层复用减少了索引器的**次数**，但每个 Reindex 层仍要给全部可见条目打分。解码器不压缩（$m=1$），1M 上下文时每个 Reindex 层的每个查询要扫描 100 万个索引器键。分层稀疏索引器（Hierarchical Sparse Indexer）利用了一个观察：浅层索引器已经知道哪些区域值得看，深层只需在这些区域里重新挑选。
+
+做法分两级。第一级在解码器的 Full 层（层 20）：它像往常一样对全部位置打分、选出自己的 top-512；同时把位置按每 8 个分块，块分等于块内位置的最高分，选出最高的 2048 个块，这 $2048\times8=16384$ 个位置构成**候选池**，写入 `candidates`。第二级在每个 Reindex 层：用自己的索引器查询打分，但只在候选池内取 top-512。
+
+<CodeFile path="src/llms_from_scratch/deepseek/csa2.py" region="candidates" />
+
+`select_candidate_blocks` 有一个容易忽略的细节：包含查询最新位置的那个块只填了一部分（之后的位置还不可见，分数为 $-\infty$），按最大值打分可能输给更旧的满块，但它装着最近的 token，所以被强制保留（分数置为 $+\infty$）。测试 `test_candidate_pool_restricts_but_keeps_newest_block` 构造了这个情形：只保留 1 个块时，被留下的是最新的块而不是分数最高的块。`test_candidate_pool_covering_everything_changes_nothing` 让候选池覆盖全部位置，分层索引退化为普通索引，输出与未启用时完全相同。
+
+代价分析很直接。设上下文长 $N$，候选池大小 $P=16384$。不分层时，5 个索引层每个查询各打 $N$ 个分；分层后，层 20 打 $N$ 个分（还要做一次块级 top-$k$），4 个 Reindex 层各打 $P$ 个分。$N=10^6$ 时，打分总量从 $5\times10^6$ 降到约 $1.07\times10^6$，并且随 $N$ 增长的只剩第一级。报告指出，这一机制在后训练阶段引入，训练与推理使用同样的候选限制，让深层索引器在它实际面对的搜索范围内被优化。
+
+## 因果编码器—解码器
+
+CSA2 减少的是存储，CED 减少的是 prefill 计算。智能体场景中，每次工具调用都会带回一大段新输入，缓存未命中时的 prefill 是主要开销。CED 受 YOCO（You Only Cache Once）启发：YOCO 让上半部分的层直接共享下半部分产生的 KV，于是 prefill 只需要跑下半部分。
+
+CED 在 V4.1 上的形式是：前 $L/2$ 层是因果编码器，后 $L/2$ 层是解码器，解码器各层的**全局** KV 不是从各自的隐藏状态 $H_l$ 投影，而是从编码器最后的输出 $H_{L/2}$ 投影：
+
+<KeyEq label="CED 的解码器全局 KV">
+
+$$
+C_l=H_{L/2}W^{KV}_l,\qquad Z_l=H_{L/2}W^{Z}_l,\qquad l>\frac L2 ,
+$$
+
+</KeyEq>
+
+$C$ 是 KV 条目，$Z$ 是压缩的门控 logits。结合 CSA2，解码器中只有层 20 是 Full 层，它的输入本来就是 $H_{L/2}$，所以在官方代码里 CED 不需要任何新模块：只要让解码器的第一层成为唯一的 kv 源。
+
+这带来一个关键性质：**对 prompt 中的大多数 token，解码器根本不需要运行。**解码器层的全局 KV 只依赖编码器输出；一个 prompt token 在解码器里的计算结果，唯一的用处是它的**滑窗 KV**——后续 token 的解码器层会通过滑窗读到它。滑窗只有 128 个 token，所以只有 prompt 末尾的那些 token 需要过解码器。prefill 的计算从 $O(NL)$ 变成 $O(NL/2+n_{\text{win}}L/2)\approx O(NL/2)$，几乎减半。这也是模型卡上“prefill 激活 8B、decode 激活 16B”的来源：prefill 时绝大多数 token 只经过 20 层编码器，decode 时每个新 token 要过全部 40 层。
+
+<Diagram width={720} height={230} label="CED 的 prefill：编码器处理全部 token，解码器只重放最后一段">
+  <Text x={20} y={30} label="prompt（N 个 token）" anchor="start" size="sm" tone="muted" />
+  <Box x={20} y={45} w={680} h={50} label="编码器 20 层：全部 N 个 token" tone="accent" />
+  <Box x={20} y={115} w={500} h={40} label="层 20 投影：整个解码器的全局 KV（覆盖全部 N 个 token）" size="sm" tone="info" />
+  <Box x={540} y={115} w={160} h={90} label="解码器 20 层" sub="只跑最后 R 个 token" tone="strong" />
+  <Box x={20} y={175} w={500} h={30} label="解码器在这些 token 上不运行" size="sm" tone="ghost" />
+  <Arrow from={[620, 95]} to={[620, 115]} />
+  <Arrow from={[270, 95]} to={[270, 115]} />
+  <Fragment slot="caption">编码器跑满全部 token，层 20 把编码器输出投影成解码器共享的全局 KV。解码器只在最后 $R$ 个 token 上运行，用来重建 decode 所需的滑窗 KV。$R$ 取 $L_{\text{dec}}(n_{\text{win}}-1)+1$ 时结果精确；V4.1 取 $R=n_{\text{win}}$，结果是近似的，称为有界重放。</Fragment>
+</Diagram>
+
+### 需要重放多少个 token
+
+解码器的滑窗 KV 是逐层计算的：解码器第 $k$ 层在位置 $p$ 的滑窗 KV 由该层在 $p$ 的输入决定，而这个输入又依赖第 $k-1$ 层在 $[p-n_{\text{win}}+1,\,p]$ 上的滑窗。依赖每过一层向前延伸 $n_{\text{win}}-1$ 个位置。要让最后一个位置在解码器 $L_{\text{dec}}$ 层后的输出精确，第一层需要从 $N-1-L_{\text{dec}}(n_{\text{win}}-1)$ 开始都是精确的，于是精确重放长度为
+
+$$
+R_{\text{exact}}=L_{\text{dec}}\,(n_{\text{win}}-1)+1 .
+$$
+
+V4.1-Flash 中 $L_{\text{dec}}=20$、$n_{\text{win}}=128$，$R_{\text{exact}}=2541$。报告引用的观察是：滑窗的**有效**感受野远小于理论值 $n_{\text{win}}\times L/2$，于是 V4.1 只重放最后 $n_{\text{win}}$ 个 token，并把滑窗截断在重放起点：从 $s$ 开始重放时，位置 $i$ 的查询只读 $[\max(s,\,i-n_{\text{win}}+1),\,i]$。这就是**解码器 SWA 有界重放**（Decoder SWA Bounded Replay）。为了稳妥，后训练时也模拟同样的重放，让模型适应。
+
+<CodeFile path="src/llms_from_scratch/deepseek/csa2.py" region="model" />
+
+`prefill_ced` 先让编码器跑满全部 token，再让第一个解码器层（必须是 Full 层）从编码器输出产生整段的全局 KV，最后让全部解码器层只在最后 `replay` 个 token 上运行，`skip_global=True` 防止 Full 层把全局 KV 重算一遍。测试 `test_ced_bounded_replay_exact_and_approximate` 在 4 个解码器层、窗口 4 的模型上验证：重放 $4\times3+1=13$ 个 token（序列长 30）时，最后位置的 logits 与完整前向**完全相同**；只重放 4 个 token 时结果不同，但误差远小于 logits 本身的尺度。
+
+## 小结
+
+- KV 的存储与读取可沿三个维度相乘地压缩：条目大小、序列维、层维；CSA2 补上层维。
+- CSA2 的每层都有自己的查询与滑窗 KV；Full 层产生并发布主 KV 与索引器键，Reindex 层复用它们并重新选 top-$k$，Reuse 层连索引都复用。模式由 `compress_ratios`、`kv_source_layers`、`index_source_layers` 三个列表静态决定。
+- V4.1-Flash：编码器 3 组 × (1 Full + 5 Reuse)，$m=2$；解码器层 20 为 Full、层 24/28/32/36 为 Reindex，$m=1$。只有 4 个 Full 层产生全局 KV。
+- 分层稀疏索引器：解码器 Full 层按 8 个位置一块选 2048 块作为候选池，Reindex 层只在池内选 top-512，深层的打分量与上下文长度无关。
+- CED：解码器的全局 KV 由编码器输出投影，prefill 时解码器只需重建滑窗 KV；精确重放需 $L_{\text{dec}}(n_{\text{win}}-1)+1$ 个 token，V4.1 只重放 $n_{\text{win}}$ 个并截断滑窗，近似但几乎无损，prefill 计算减半。
+
+## 练习
+
+1. 把 V4.1-Flash 解码器的 Reindex 层全部改为 Reuse，存储与计算各有什么变化？可能损失什么？
+
+<details>
+<summary>答案</summary>
+
+存储不变：主 KV 与索引器键本来就只有层 20 一份，Reindex 层不额外存东西。计算减少：4 个 Reindex 层不再计算索引器查询与候选池内的打分。损失的是选择的多样性：所有 20 个解码器层都只能看层 20 选出的同一组 512 个位置；Reindex 让第 24、28、32、36 层可以根据更深的表示重新决定看哪里，而且分层索引器把这部分计算控制在了常数大小。
+
+</details>
+
+2. 证明：若候选池包含了每个查询所有可见的位置，分层索引器的输出与不分层完全相同。
+
+<details>
+<summary>答案</summary>
+
+Reindex 层的打分公式不变，候选池只是一个掩码：池外位置分数置为 $-\infty$。若池包含所有可见位置，掩码不改变任何可见位置的分数，top-$k$ 的结果不变（在平分规则确定的前提下），注意力输出也就不变。Full 层自身的 top-$k$ 本来就不受候选池影响。测试用足够大的 `candidate_topk_blocks` 验证了这一点。
+
+</details>
+
+3. 一个 4 层解码器、窗口 4 的模型，重放 12 个 token（比精确长度少 1）时，哪个量最先变得不精确？
+
+<details>
+<summary>答案</summary>
+
+设序列长 $N$，重放起点 $s=N-12$。解码器第 1 层在位置 $p$ 精确当且仅当 $p-3\ge s$，即 $p\ge N-9$。第 2 层在 $p$ 精确需要第 1 层在 $[p-3,p]$ 精确且自身窗口不被截断，即 $p\ge N-6$；第 3 层需要 $p\ge N-3$；第 4 层需要 $p\ge N$，但最后一个位置是 $N-1$，所以第 4 层在最后位置的输出不精确——它读到了第 3 层在 $N-4$ 处的不精确滑窗 KV。
+
+</details>
+
+4. CED 让 prefill 只激活 8B 参数，为什么 decode 仍然是 16B？如果把 CED 推到极致，让解码器的**滑窗** KV 也来自编码器，会发生什么？
+
+<details>
+<summary>答案</summary>
+
+decode 时新 token 的输出要经过全部 40 层才能得到 logits，所以每个 decode token 激活全部 40 层的专家（每层 6 个路由专家 + 1 个共享专家）与注意力，约 16B。若滑窗 KV 也来自编码器，prefill 时解码器就完全不用跑，但解码器各层看到的所有历史都只是编码器的表示，解码器层之间失去了逐层累积的局部计算深度（KV 生成的“计算深度”减半）；报告强调 CED 保留逐层的滑窗计算，正是为了维持这部分深度。
+
+</details>
+
+## 参考文献
+
+- DeepSeek-AI. [DeepSeek-V4.1-Flash: Pushing the Limits of KV Cache Compression](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/DeepSeek_V41_Tech_Report.pdf). 2026（§2.2 CED，§2.3 CSA2 与分层稀疏索引器，§3.1.2 跨流水线阶段的共享状态训练，§3.2.2 SWA 有界重放，§4.2.1 模型配置）.
+- 官方推理代码：[DeepSeek-V4.1-Flash inference/model.py](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/inference/model.py)（`Compressor`、`Indexer`、`select_candidate_blocks`、`Attention`、`SharedAttentionRuntime`）与 [inference/config.json](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/inference/config.json).
+- Sun et al. [You Only Cache Once: Decoder-Decoder Architectures for Language Models](https://arxiv.org/abs/2405.05254). NeurIPS 2024.
+- Brandon et al. [Reducing Transformer Key-Value Cache Size with Cross-Layer Attention](https://arxiv.org/abs/2405.12981). 2024.
+- Sun et al. You Only Index Once: Cross-Layer Sparse Attention with Shared Routing. arXiv:2606.06467, 2026.

@@ -1,0 +1,52 @@
+---
+title: DeepSeek 技术全景
+description: 以 DeepSeek 官方推理代码为事实依据，把 V2 到 V4.1 的关键设计逐一拆开、重写成可测试的 PyTorch，并串成一条完整的技术演进线。
+order: 0
+---
+
+前九个部分按“机制”组织：注意力变体、MoE、稀疏注意力、mHC、FP8 训练、专家并行、GRPO、FlashAttention、PagedAttention……DeepSeek 的名字散落在几乎每一章。这样组织的好处是每个机制都能被单独讲透，代价是读者很难看到一个真实模型如何把这些部件**同时**装在一起，又为什么每一代都要拆掉一部分、换上新的。本部分换一个角度：以一个开源模型家族为主线，对照它的官方推理代码，把从 2024 年的 DeepSeek-V2 到 2026 年 10 月的 DeepSeek-V4.1-Flash 的核心技术重新走一遍。
+
+选 DeepSeek 有三个原因。第一，它的每一代旗舰模型都附带了一份可读的参考实现：`DeepSeek-V3/inference/model.py`、`DeepSeek-V3.2-Exp/inference/model.py`、`DeepSeek-V4-Flash/inference/model.py`、`DeepSeek-V4.1-Flash/inference/model.py` 与 `engram.py`。论文里语焉不详的细节，例如压缩条目用哪个位置做 RoPE、索引器的键从哪里来、平分时 top-$k$ 怎样选，在源码里都是确定的。第二，它的演进有一条清晰的主线：**每 token 的全局 KV Cache**。从 2023 年 DeepSeek LLM 67B 的约 380 KiB，到 V3 的 68.6 KiB，再到 V4.1-Flash 的 890 字节，三年缩小了 437 倍，而且每一次缩小都对应一种新的结构。第三，它在模型之外开源了大量基础设施（FlashMLA、DeepEP、DeepGEMM、DualPipe、3FS、TileKernels、DeepSelect、DeepSpec 等），可以把架构与系统放在一起看。
+
+## 本部分的脉络
+
+<Diagram width={720} height={330} label="第十部分各章与 DeepSeek 各代模型的对应关系">
+  <Box x={20} y={20} w={680} h={50} label="DeepSeek 开源模型谱系与全局 KV 账本" sub="lineage.py" tone="strong" />
+  <Box x={20} y={110} w={150} h={58} label="V2/V3" sub="MLA · 分组路由 · FP8" tone="accent" />
+  <Box x={195} y={110} w={150} h={58} label="V3.2" sub="闪电索引器 · DSA" tone="accent" />
+  <Box x={370} y={110} w={150} h={58} label="V4" sub="压缩器 · 共享 KV" tone="accent" />
+  <Box x={545} y={110} w={155} h={58} label="V4.1" sub="CSA2 · CED" tone="accent" />
+  <Arrow from={[170, 139]} to={[195, 139]} />
+  <Arrow from={[345, 139]} to={[370, 139]} />
+  <Arrow from={[520, 139]} to={[545, 139]} />
+  <Box x={20} y={210} w={210} h={58} label="KV 系统" sub="FP4 缓存 · 有界重放" tone="info" />
+  <Box x={255} y={210} w={210} h={58} label="Engram 与 Single-Pass mHC" sub="条件记忆 · 残差融合" tone="info" />
+  <Box x={490} y={210} w={210} h={58} label="DSpark" sub="半自回归草稿 · 调度" tone="info" />
+  <Box x={20} y={290} w={680} h={30} label="训练配方：按头 Muon · Sinkhorn 均衡更新 · 按模态偏置 · 可控推理强度" size="sm" />
+  <Arrow from={[622, 168]} to={[125, 210]} tone="muted" dashed />
+  <Arrow from={[622, 168]} to={[360, 210]} tone="muted" dashed />
+  <Arrow from={[622, 168]} to={[595, 210]} tone="muted" dashed />
+  <Fragment slot="caption">第一行是全部分的地图；第二行四章按代际读官方注意力与 MoE 代码，每一章都以上一章为前提；第三行三章是 V4.1 中与注意力并列的系统与模块；最后一章讨论支撑这些结构的训练方法。</Fragment>
+</Diagram>
+
+[DeepSeek 开源模型谱系：2023—2026](/deepseek/lineage/) 收集 deepseek-ai 在 Hugging Face 与 GitHub 上发布的全部主要模型与基础设施，并用一段代码按各代官方配置逐层累加“每 token 的全局 KV 字节数”，把模型卡上的 4 倍、437 倍等数字算出来。
+
+随后四章按代际读注意力。[读 V3 官方代码：MLA、分组路由与 FP8 块量化](/deepseek/v3/) 把[注意力变体：MQA、GQA 与 MLA](/architecture/attention-variants/) 里推导过的矩阵吸收对应到官方的 `wkv_a`/`wkv_b` 权重布局，再读 `Gate` 的分组受限路由与 128×128 块量化。[V3.2：闪电索引器与稀疏 MLA 的两种模式](/deepseek/dsa/) 读 `Indexer`：Hadamard 旋转、ReLU 打分，以及同一组 top-$k$ 在 prefill 与 decode 中分别走“MHA 模式”和“MQA 模式”。[V4：压缩器、共享 KV 与汇聚注意力](/deepseek/v4-attention/) 读 V4 的 `Compressor` 怎样在 prefill 与逐 token decode 中得到完全相同的压缩条目，以及逆 RoPE、注意力汇聚与分组输出投影。[V4.1：CSA2 与因果编码器—解码器](/deepseek/csa2-ced/) 是本部分的重心：主 KV 与索引跨层共享的三种模式、分层稀疏索引器，以及“解码器的全局 KV 来自编码器输出”如何让 prefill 计算减半。
+
+接下来三章讨论 V4.1 中与注意力并列的部件。[V4.1 的 KV 系统：FP4 缓存、有界重放与持久化](/deepseek/kv-system/) 把 890 字节背后的格式与“滑窗 KV 不再落盘”的系统决策讲清楚；[Engram 与 Single-Pass mHC](/deepseek/engram-mhc/) 读 `engram.py` 的哈希与门控，以及把 mHC 的读入系数推迟一层换来的单遍 kernel；[DSpark：半自回归草稿与置信度调度](/deepseek/dspark/) 讨论取代 MTP 的投机解码模块。最后，[训练配方：从 GRPO 到 Sinkhorn 均衡更新](/deepseek/training/) 汇总各代在优化器、精度与后训练上的变化。
+
+## 与前后部分的关系
+
+本部分是全书的综合案例，默认你已经读过[现代架构：2017—2026](/architecture/)。那里推导过的结论这里不再重复，而是直接链接回去：MLA 的吸收见[注意力变体：MQA、GQA 与 MLA](/architecture/attention-variants/)，DSA 的训练流程见[稀疏注意力：从 NSA、DSA 到压缩注意力](/architecture/sparse-attention/)，mHC 的双随机约束见[残差流的扩展：Hyper-Connections 与 mHC](/architecture/residual-streams/)，无辅助损失均衡见[混合专家 MoE](/architecture/moe/)。系统方面会用到[推理系统](/inference/)中的 prefill/decode 成本模型、PagedAttention 与投机解码，训练方面会用到[预训练](/pretraining/)中的 Muon 与[后训练与对齐](/post-training/)中的 GRPO。
+
+## 阅读与动手建议
+
+每章都对照一个官方文件。读代码时建议同时打开三样东西：官方源码、本书的移植（`src/llms_from_scratch/deepseek/`）、对应的测试（`tests/deepseek/`）。移植刻意保留官方的变量名（`wkv_a`、`compress_ratios`、`kv_source_layers`、`hc_split_sinkhorn`……），去掉的是张量并行、FP8/FP4 GEMM 与 TileLang kernel 这些工程外壳；每个被保留的机制都有一条“等价性”测试：吸收路径等于朴素路径、逐 token decode 等于一次 prefill、候选池覆盖全部时分层索引等于普通索引、足够长的有界重放等于完整前向。
+
+```sh
+uv run pytest tests/deepseek -q
+```
+
+关于事实来源的约定：模型参数、层数与缓存格式取自官方 `config.json`、`inference/config.json` 与推理代码；机制描述取自各代技术报告；Hugging Face 与 GitHub 的发布日期取自其 API（截至 2026-10-30）。本书的移植是**教学重实现**，不能加载官方权重；测试证明的是移植内部的正确性与它对官方数据流的忠实程度，而不是与官方模型数值等价。DeepSeek-V4.1 发布不久，若官方后续修订报告或代码，以官方为准。
+
+<ChapterList part="deepseek" />

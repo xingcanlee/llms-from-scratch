@@ -40,7 +40,7 @@ order: 0
 
 本部分默认你已经读完[从零实现 Transformer](/transformer/)，尤其是[位置编码：从正弦到 RoPE](/transformer/positional-encoding/)、[Transformer 块：归一化、残差与前馈网络](/transformer/transformer-block/) 和[文本生成：解码策略与 KV Cache](/transformer/generation/)。代码直接 import 第三部分的 `transformer/model.py`：GQA 就是它的 `CausalSelfAttention`，MoE 的专家就是它的 `SwiGLU`，MTP 模块就是它的 `Block`。
 
-这里只讲“结构是什么、为什么这样设计、数学上为什么成立”。怎样把这些结构训练好属于[预训练](/pretraining/)：Muon 优化器、QK-Norm 与 z-loss 等稳定性技巧、FP8 训练、缩放定律。MoE 的专家并行与 all-to-all 通信在[专家并行与 all-to-all](/distributed/expert-parallel/) 中展开。FlashAttention 等高效 kernel 在[FlashAttention：IO 感知的注意力](/gpu/flash-attention/)。MLA 的吸收计算、稀疏注意力与 MTP 草稿在服务系统中如何落地，见[推理系统](/inference/)，尤其是[投机解码](/inference/speculative-decoding/)与[分布式推理：并行、PD 分离与大规模 MoE 服务](/inference/distributed-inference/)。
+这里只讲“结构是什么、为什么这样设计、数学上为什么成立”。怎样把这些结构训练好属于[预训练](/pretraining/)：Muon 优化器、QK-Norm 与 z-loss 等稳定性技巧、FP8 训练、缩放定律。MoE 的专家并行与 all-to-all 通信在[专家并行与 all-to-all](/distributed/expert-parallel/) 中展开。FlashAttention 等高效 kernel 在[FlashAttention：IO 感知的注意力](/gpu/flash-attention/)。MLA 的吸收计算、稀疏注意力与 MTP 草稿在服务系统中如何落地，见[推理系统](/inference/)，尤其是[投机解码](/inference/speculative-decoding/)与[分布式推理：并行、PD 分离与大规模 MoE 服务](/inference/distributed-inference/)。若想看这些部件怎样在一个真实模型家族里组合、又怎样一代代被替换，[DeepSeek 技术全景](/deepseek/)对照官方推理代码，把 DeepSeek 从 V2 到 V4.1 的注意力、MoE、残差与训练配方完整走了一遍。
 
 ## 阅读与动手建议
 
